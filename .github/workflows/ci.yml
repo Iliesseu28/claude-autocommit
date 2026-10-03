@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mod:
+    name: validate and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Manifests, hooks, settings, JSON, no long dash, no machine path
+        run: python3 scripts/check.py
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@latest
+      - name: claude plugin validate --strict (marketplace)
+        run: claude plugin validate . --strict
+      - name: claude plugin validate --strict (mod and its state contract)
+        run: claude plugin validate .claude-plugin/plugin.json --strict
+      - name: claude plugin test
+        run: claude plugin test .
