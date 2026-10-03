@@ -51,7 +51,7 @@ on Windows 11 and in headless `claude -p` runs.
 | **Undo, squash, push** | `/commits undo`, `/commits squash`, `/commits push`. |
 | **A status bar** | Model, effort, context gauge, Remote Control, and the commit counters, above the prompt. |
 
-<p align="center"><img src="docs/bar.png" alt="The bar above the prompt: model, effort, context gauge, Remote Control, 3 auto commits, 1 to push" width="100%"></p>
+<p align="center"><img src="docs/bar.png" alt="The bar above the prompt: model, effort, context gauge, 3 auto-commits, 2 files pending" width="100%"></p>
 
 ## How it works
 
