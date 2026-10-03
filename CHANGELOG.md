@@ -9,6 +9,8 @@ First public release.
 - Tracks Claude's own changes only: file edits by path, shell commands by comparing `git status` and content
   hashes before and after. Read-only commands skip the comparison.
 - Subagents: each agent's files are committed when its own turn ends.
+- Safe beside your own git work: a git command Claude runs never overlaps an auto-commit, each session keeps its own
+  index file, and an auto-commit whose `HEAD` moved meanwhile is rolled back and retried, never someone else's commit.
 - Secret guard on every commit and push: over 20 key formats, forbidden file names, new files over 5 MB.
 - Optional bug alerts from the same model call.
 - `/commits` report, `pause`, `resume`, `now`, `undo`, `squash`, `push` (English and French words).

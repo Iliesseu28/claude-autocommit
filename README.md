@@ -63,7 +63,7 @@ flowchart LR
   I --> X{"Secret scan<br/>of the staged patch"}
   X -->|"flagged"| A["File dropped,<br/>alert shown"]
   X --> M["Haiku writes the message<br/>and flags obvious bugs"]
-  M --> C["git commit<br/>(your hooks run)"]
+  M --> C["git commit"]
   C --> P{"Remote listed<br/>in autoPush?"}
   P -->|"yes"| Q["Scan outgoing commits,<br/>pre-push check, git push"]
 ```
@@ -95,7 +95,7 @@ To keep a repo out entirely, create an empty `.no-auto-commit` file at its root 
 | `commitModel` | `haiku` | Model that writes the messages: `haiku`, `sonnet` or `opus`. |
 | `commitLanguage` | `English` | Language of the commit messages: any language name. |
 | `bugCheck` | `true` | Ask the model to flag obvious bugs in the diff. |
-| `autoPush` | empty | Remotes to push to after each commit, comma separated: `me/notes`, `github.com/me`, or `*` for all. Empty: never pushes unless you ask. |
+| `autoPush` | empty | Remotes to push to after each commit, comma separated: `me/notes`, `github.com/me`, or `*` for all. Empty: never pushes unless you ask. A push sends the whole branch, so your own unpushed commits on it go too (scanned like the others). |
 | `prePushCommand` | empty | A command that must succeed before any push. `{root}` is the repo root, `{files}` a file listing the paths the push changes. |
 | `bar` | `full` | `full`, `compact` (context and commits only) or `off`. |
 | `maxFilesPerCommand` | `40` | A shell command that changes more files than this at once (an install into a tracked folder, a code generator) is reported instead of committed. |
@@ -104,8 +104,12 @@ To keep a repo out entirely, create an empty `.no-auto-commit` file at its root 
 
 - **Commit a file Claude did not change.** Your other dirty files stay out. (A file Claude does edit is committed whole, so
   any uncommitted change you had already made to that same file goes with it.)
-- **Touch what you staged.** The commit is built in `.git/autocommit.index`; afterwards only the committed paths are refreshed in your index.
-- **Skip your git hooks.** No `--no-verify`. A refused commit becomes an alert with the hook's first line, and the files stay pending for the next turn.
+- **Touch what you staged.** The commit is built in an index file of its own in `.git` (one per session); afterwards only
+  the committed paths are refreshed in your index.
+- **Run beside a git command of Claude's.** If Claude commits by hand, the command waits for an auto-commit under way, and
+  no auto-commit starts while it runs. No `index.lock` fights, no commit built on a stale `HEAD`.
+- **Undo someone else's commit.** If `HEAD` moves while the auto-commit is being made (a commit from your terminal,
+  another session, a pull), the auto-commit is rolled back and retried next turn; your commit stays on top.
 - **Commit mid-merge, mid-rebase, mid-cherry-pick or on a detached `HEAD`.** The files wait.
 - **Commit a likely secret** or a new file over 5 MB.
 - **Push unless you asked** or the remote is in `autoPush`. Never a force push.
@@ -117,7 +121,11 @@ To keep a repo out entirely, create an empty `.no-auto-commit` file at its root 
 - During a shell command, the mod compares the repo before and after. A file **you** save in your editor while that
   command runs looks like the command's work and will be committed with it.
 - Two sessions editing the same file: the commit takes the file as it is on disk.
+- A subagent's files are committed when that subagent finishes. If that commit is refused, they are retried each time
+  a turn ends.
 - Files still pending when you quit stay uncommitted (they show in `git status`); a new session does not pick them up.
+- Your git hooks do not run on auto-commits: Claude Code starts a mod's git commands with the repo's hooks turned off,
+  a safety default. Checks that must pass belong in `prePushCommand` (run before every push) or in CI.
 - Alerts are notifications and the `/commits` report. In headless `claude -p` runs nobody sees them: read `git log`.
 - The secret scan is pattern based. It catches the common key formats, not every secret; keep a real scanner such as
   [gitleaks](https://github.com/gitleaks/gitleaks) in your `prePushCommand` or CI if a leak would hurt.
