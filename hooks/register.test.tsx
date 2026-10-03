@@ -10,6 +10,8 @@ import { barCells, barColor, forget, newWork, shortTokens, track } from './regis
 const ROOT = '/repo'
 const GIT_DIR = '/repo/.git'
 const BASE = '0'.repeat(40)
+// The session id is `sess-1234-abcd`: the mod's files in .git end with this.
+const TAG = '-sess1234'
 // Built from pieces so this file never holds a whole key.
 const KEY = ['ghp', '_', 'Ab1'.repeat(12)].join('')
 
@@ -40,7 +42,7 @@ const run = (stdout = '', exitCode = 0, stderr = '') => ({
   isStderrTruncated: false,
 })
 
-type Commit = { parent: string | null; files: string[]; patch: string; subject: string }
+type Commit = { parent: string | null; files: string[]; patch: string; subject: string; tree?: string }
 type Call = { args: string[]; stdin: string; isTempIndex: boolean }
 
 const patchOf = (file: string, lines: readonly string[]): string =>
@@ -66,6 +68,12 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
     commitError: '',
     // What runs while `git commit` does: a commit from elsewhere, a hook's `git add`.
     beforeCommit: (): void => undefined,
+    afterCommit: (): void => undefined,
+    indexTree: '',
+    // A shell command held open until the test lets it end.
+    bashGate: Promise.resolve(),
+    inBash: false,
+    commitsDuringBash: 0,
     hookAdds: [] as string[],
     staged: new Set<string>(),
     calls: [] as Call[],
@@ -104,6 +112,7 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
       case 'rev-parse': {
         if (rest.includes('--show-toplevel')) return run(`${ROOT}\n${dir === ROOT ? '' : `${dir.slice(ROOT.length + 1)}/`}\n`)
         if (rest.includes('--absolute-git-dir')) return run(`${GIT_DIR}\n`)
+        if (last.endsWith('^{tree}')) return run(`${w.commits.get(last.slice(0, -7))?.tree ?? ''}\n`)
         if (last.endsWith('^')) {
           const ref = last.slice(0, -1)
           const parent = w.commits.get(ref === 'HEAD' ? w.head : ref)?.parent ?? null
@@ -151,12 +160,17 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
         const files = [...w.staged].sort()
         const sha = nextSha()
         const patch = files.map(f => patchOf(f, w.lines.get(f) ?? [])).join('')
-        w.commits.set(sha, { parent: w.head, files, patch, subject: subjectAt(last) })
+        w.commits.set(sha, { parent: w.head, files, patch, subject: subjectAt(last), tree: `tree-${sha}` })
+        w.indexTree = `tree-${sha}`
         w.head = sha
         for (const f of files) w.status.delete(f)
         w.staged.clear()
+        if (w.inBash) w.commitsDuringBash++
+        w.afterCommit()
         return run()
       }
+      case 'write-tree':
+        return run(`${w.indexTree}\n`)
       case 'commit-tree': {
         const base = rest.includes('-p') ? (rest[rest.indexOf('-p') + 1] ?? null) : null
         const files = new Set<string>()
@@ -196,6 +210,7 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
   }
 
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'sess-1234-abcd' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.usage', () => ({ value: USAGE }))
   on('settings.read', () => ({ value: SETTINGS }))
@@ -221,9 +236,14 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
       : JSON.stringify({ subject: 'feat: update the notes', body: '', warnings: w.warnings })
     return { value: { isAnswered: true as const, text, usage: MODEL_USAGE } }
   })
-  on('tool.call', (_$, e) => {
+  on('tool.call', async (_$, e) => {
     const input = e as unknown as { tool: string; command?: string }
-    if (input.tool === 'Bash') w.onBash(input.command ?? '')
+    if (input.tool === 'Bash') {
+      w.onBash(input.command ?? '')
+      w.inBash = true
+      await w.bashGate
+      w.inBash = false
+    }
     return { result: { type: 'create' }, text: 'done' } as never
   })
   on('turn.complete', () => ({ text: '' }))
@@ -356,7 +376,11 @@ test('end of turn: one commit of the session files, secret and .env held back', 
   await $.turn.complete(turnEnd())
 
   // Built in an index of its own: the .env never reaches it, the leak is dropped.
-  expect(callsOf('read-tree').map(c => c.isTempIndex)).toEqual([true])
+  // Seeded from HEAD, emptied once committed so a session leaves a tiny file.
+  expect(callsOf('read-tree').map(c => [c.args[1], c.isTempIndex])).toEqual([
+    ['HEAD', true],
+    ['--empty', true],
+  ])
   expect(callsOf('add').map(c => [c.stdin.split('\0').sort(), c.isTempIndex])).toEqual([[['src/a.ts', 'src/leak.ts'], true]])
   expect(callsOf('commit').map(c => c.isTempIndex)).toEqual([true])
   expect(w.commits.get(w.head)?.files).toEqual(['src/a.ts'])
@@ -365,13 +389,13 @@ test('end of turn: one commit of the session files, secret and .env held back', 
   // The foreign file and the held-back ones stay as they were.
   expect([...w.status.keys()].sort()).toEqual(['.env', 'other.ts', 'src/leak.ts'])
 
-  const message = w.files.get(`${GIT_DIR}/AUTOCOMMIT_MSG`) ?? ''
+  const message = w.files.get(`${GIT_DIR}/AUTOCOMMIT_MSG${TAG}`) ?? ''
   expect(message).toContain('feat: update the notes')
   expect(message).toContain('Auto-commit: claude-autocommit')
   expect(message).toContain('Co-Authored-By: Bot <bot@example.com>')
   expect(message).not.toContain('noreply@anthropic.com')
   expect(message).not.toContain(KEY)
-  expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_RESET`)).toBe('')
+  expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_RESET${TAG}`)).toBe('')
   expect(w.toasts).toContain('✓ repo 1111111  feat: update the notes')
 
   expect(await bandText($)).toContain('⚠ 3')
@@ -392,7 +416,7 @@ test('the default trailer names the session model', async ($, on) => {
   touch('a.ts')
   await $.tool.call(write('a.ts'))
   await $.turn.complete(turnEnd())
-  expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_MSG`)).toContain('Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>')
+  expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_MSG${TAG}`)).toContain('Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>')
 })
 
 test('shell commands: changes are found by comparing the repo before and after', { options: { maxFilesPerCommand: 3 } }, async ($, on) => {
@@ -451,7 +475,7 @@ test('a refused commit (pre-commit hook) keeps the files pending', async ($, on)
   await $.tool.call(write('a.ts'))
   await $.turn.complete(turnEnd())
   expect(w.head).toBe(BASE)
-  expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_RESET`)).toBe('')
+  expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_RESET${TAG}`)).toBe('')
   const text = await report($)
   expect(text).toContain('commit refused (lint failed: 2 errors)')
   expect(text).toContain('1 file pending')
@@ -472,7 +496,7 @@ test('a commit made elsewhere during ours: ours is rolled back, retried next tur
   // The person's commit stays on top; nothing of theirs went into ours.
   expect(w.head).toBe(theirs)
   expect(w.userResets).toEqual([])
-  expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_RESET`)).toBe('')
+  expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_RESET${TAG}`)).toBe('')
   const text = await report($)
   expect(text).toContain('HEAD moved during the commit, undone; retrying next turn')
   expect(text).toContain('1 file pending')
@@ -494,6 +518,43 @@ test('a hook that stages other files: the commit is rolled back, the files left'
   const text = await report($)
   expect(text).toContain('a git hook staged other files (generated.lock): commit undone, left uncommitted')
   expect(text).toContain('0 files pending')
+})
+
+test('a commit landing right after ours is never rolled back', async ($, on) => {
+  const { w, touch } = fakeWorld(on)
+  await $.session.start(start())
+  const theirs = 'e'.repeat(40)
+  w.afterCommit = () => {
+    w.commits.set(theirs, { parent: w.head, files: ['mine.md'], patch: '', subject: 'mine', tree: 'tree-theirs' })
+    w.head = theirs
+    w.afterCommit = () => undefined
+  }
+  touch('a.ts')
+  await $.tool.call(write('a.ts'))
+  await $.turn.complete(turnEnd())
+  expect(w.head).toBe(theirs)
+  expect(w.commits.get(theirs)?.parent).toBe('1'.repeat(40))
+  expect(await report($)).toContain('another commit landed right after the auto-commit: check git log')
+})
+
+test("no auto-commit runs during Claude's own git command", async ($, on) => {
+  const { w, touch, clock } = fakeWorld(on)
+  await $.session.start(start(true))
+  touch('a.ts')
+  await $.tool.call(write('a.ts'))
+  let release = (): void => undefined
+  w.bashGate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  // The turn ends while Claude's `git commit` of other work is still running.
+  const command = $.tool.call({ tool: 'Bash', command: 'git commit -qm "wip" -- notes.md' })
+  await $.turn.complete(turnEnd())
+  await clock.advance(5000)
+  expect(w.commitsDuringBash).toBe(0)
+  release()
+  await command
+  await clock.advance(2000)
+  expect(w.commits.get(w.head)?.files).toEqual(['a.ts'])
 })
 
 test("a subagent's refused files are retried at a later turn end", async ($, on) => {
@@ -577,7 +638,7 @@ test('squash folds the session commits into one, undo steps back', async ($, on)
   expect(await report($, 'squash')).toBe('repo: 3 auto-commits squashed into 4444444 "feat: add the three notes".')
   expect(callsOf('commit-tree')[0]?.args.slice(0, 4)).toEqual(['commit-tree', `${third}^{tree}`, '-p', BASE])
   expect(chain()).toEqual(['4'.repeat(40), BASE])
-  const message = w.files.get(`${GIT_DIR}/AUTOCOMMIT_MSG`) ?? ''
+  const message = w.files.get(`${GIT_DIR}/AUTOCOMMIT_MSG${TAG}`) ?? ''
   expect(message).toContain('Squashed commits:\n- feat: update the notes')
   expect(await bandText($)).toContain('1 auto')
 
@@ -614,8 +675,8 @@ test(
     await $.tool.call(write('a.ts'))
     await $.turn.complete(turnEnd())
 
-    expect(w.checks).toEqual([['check-secrets', ROOT, '--list', `${GIT_DIR}/AUTOCOMMIT_PUSH_LIST`]])
-    expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_PUSH_LIST`)).toBe('a.ts\n')
+    expect(w.checks).toEqual([['check-secrets', ROOT, '--list', `${GIT_DIR}/AUTOCOMMIT_PUSH_LIST${TAG}`]])
+    expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_PUSH_LIST${TAG}`)).toBe('a.ts\n')
     expect(callsOf('push').map(c => c.args)).toEqual([['push', '--quiet', 'origin', 'HEAD:refs/heads/main']])
     expect(w.toasts).toContain('↑ repo: 1 commit pushed')
 

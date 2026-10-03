@@ -75,7 +75,8 @@ const PATCH_FLAGS = [
   '--text', '--no-textconv', '--no-color', '--no-ext-diff', '--no-renames',
   '--src-prefix=a/', '--dst-prefix=b/',
 ]
-// Files the mod keeps inside `.git`, never in the working tree.
+// Files the mod keeps inside `.git`, never in the working tree, each named
+// for its session (`w.tag`) so two sessions in one repo never share one.
 const INDEX_FILE = 'autocommit.index'
 const MESSAGE_FILE = 'AUTOCOMMIT_MSG'
 const JOURNAL_FILE = 'AUTOCOMMIT_RESET'
@@ -111,11 +112,17 @@ export type Work = {
   edits: Map<string, number>
   // the drain, undo or squash under way: one at a time
   running: Promise<void> | null
+  // Claude's own git commands under way: no drain starts meanwhile
+  gitCommands: number
+  // suffix of the mod's files in `.git`, from the session id
+  tag: string
   isPaused: boolean
   isPushAsked: boolean
 }
 
 export const newWork = (): Work => ({
+  gitCommands: 0,
+  tag: '',
   cwd: '.',
   isInteractive: true,
   tracked: new Map(),
@@ -158,6 +165,13 @@ export const pendingCount = (w: Work): number => {
 }
 
 const editKey = (root: string, path: string): string => `${root}\0${path}`
+
+// `-` and the session id's first 8 letters and digits: the suffix of the
+// mod's files in `.git`.
+export const tagOf = (sessionId: string): string => {
+  const s = sessionId.replace(/[^A-Za-z0-9]/g, '').slice(0, 8)
+  return s === '' ? '' : `-${s}`
+}
 
 export const track = (w: Work, agent: string, root: string, paths: readonly string[]): void => {
   if (paths.length === 0) return
@@ -344,16 +358,15 @@ async function unstage(
 // A commit is made in an index of its own, then the person's index catches up
 // for its paths. A journal written before the commit lets the next run finish
 // that catch-up if the process died in between.
-async function writeJournal($: EngineInterface, gitDir: string, head: string, paths: readonly string[]): Promise<void> {
-  await $.fs.write(`${gitDir}/${JOURNAL_FILE}`, [head, ...paths].join('\0'))
+async function writeJournal($: EngineInterface, path: string, head: string, paths: readonly string[]): Promise<void> {
+  await $.fs.write(path, [head, ...paths].join('\0'))
 }
 
-async function clearJournal($: EngineInterface, gitDir: string): Promise<void> {
-  await $.fs.write(`${gitDir}/${JOURNAL_FILE}`, '')
+async function clearJournal($: EngineInterface, path: string): Promise<void> {
+  await $.fs.write(path, '')
 }
 
-export async function recoverJournal($: EngineInterface, root: string, gitDir: string): Promise<void> {
-  const path = `${gitDir}/${JOURNAL_FILE}`
+export async function recoverJournal($: EngineInterface, root: string, path: string): Promise<void> {
   if (!(await $.fs.exists(path))) return
   const text = String(await $.fs.read(path).catch(() => ''))
   if (text === '') return
@@ -363,7 +376,7 @@ export async function recoverJournal($: EngineInterface, root: string, gitDir: s
   const now = out(await git($, root, ['rev-parse', '-q', '--verify', 'HEAD']).catch(() => null))
   // HEAD moved since the journal: the commit was made, its index catch-up was not.
   if (now !== '' && now !== head) await unstage($, root, paths, true)
-  await clearJournal($, gitDir)
+  await clearJournal($, path)
 }
 
 // The staged patch of `paths`, in calls short enough for any command line;
@@ -442,7 +455,8 @@ export async function commitRepo($: EngineInterface, c: Ctx, root: string, paths
   if (await $.fs.exists(`${root}/.no-auto-commit`)) return none([...paths])
   const gitDir = await gitDirOf($, root)
   if (gitDir === null || (await isBusy($, root, gitDir))) return none([])
-  await recoverJournal($, root, gitDir)
+  const journal = `${gitDir}/${JOURNAL_FILE}${c.w.tag}`
+  await recoverJournal($, root, journal)
 
   const status = await statusOf($, root)
   if (status === null) return none([])
@@ -463,7 +477,7 @@ export async function commitRepo($: EngineInterface, c: Ctx, root: string, paths
   }
   if (candidates.length === 0) return none(settled)
 
-  const env = { GIT_INDEX_FILE: `${gitDir}/${INDEX_FILE}` }
+  const env = { GIT_INDEX_FILE: `${gitDir}/${INDEX_FILE}${c.w.tag}` }
   const head = out(await git($, root, ['rev-parse', '-q', '--verify', 'HEAD']))
   const hasHead = head !== ''
   const seed = await git($, root, hasHead ? ['read-tree', 'HEAD'] : ['read-tree', '--empty'], { env })
@@ -500,31 +514,42 @@ export async function commitRepo($: EngineInterface, c: Ctx, root: string, paths
   const diff = (await cachedDiff($, root, ready, '-U3', env)) ?? ''
   const stat = ready.map(p => `${status.get(p) ?? '  '} ${p}`).join('\n')
   const text = await messageFor($, c, ready, stat, diff)
-  const messagePath = `${gitDir}/${MESSAGE_FILE}`
+  const messagePath = `${gitDir}/${MESSAGE_FILE}${c.w.tag}`
   await $.fs.write(messagePath, `${commitMessage(text, await trailerLines($))}\n`)
 
   // HEAD moved while the message was written: the index is stale, next turn retries.
   if (out(await git($, root, ['rev-parse', '-q', '--verify', 'HEAD'])) !== head) return none(settled)
-  await writeJournal($, gitDir, head, ready)
-  // A slow pre-commit hook gets two minutes; the person's hooks always run.
+  await writeJournal($, journal, head, ready)
+  // Claude Code runs a mod's git with the repo's hooks off; two minutes covers a slow disk.
   const commit = await git($, root, ['commit', '-q', '-F', messagePath], { env, timeoutMs: 120_000 }).catch(
     () => null,
   )
   if (commit === null || commit.exitCode !== 0) {
-    await clearJournal($, gitDir)
+    await clearJournal($, journal)
     await alert($, c, name, t.commitRefused(firstLine(commit?.stderr || commit?.stdout) || t.timedOut))
     return none(settled)
   }
 
   // The commit must sit on the HEAD its index was built from and hold only the
   // scanned paths. A HEAD that moved during the commit (a commit from a
-  // terminal, a pull), or a hook that staged more files, would slip other
-  // changes in: the commit is rolled back and the paths stay pending.
+  // terminal or another session, a pull) would undo that work, and a hook
+  // that staged more files (should hooks ever run) would slip them in: the
+  // commit is rolled back.
   const sha = out(await git($, root, ['rev-parse', 'HEAD']))
+  // Our index holds the tree just committed: a HEAD with another tree is a
+  // commit that landed right after ours, never ours to roll back.
+  const tree = out(await git($, root, ['write-tree'], { env }))
+  const headTree = sha === '' ? '' : out(await git($, root, ['rev-parse', `${sha}^{tree}`]))
+  await git($, root, ['read-tree', '--empty'], { env }).catch(() => undefined)
+  if (tree === '' || headTree !== tree) {
+    if (await unstage($, root, ready, true)) await clearJournal($, journal)
+    await alert($, c, name, t.headRaced)
+    return none(settled)
+  }
   const parent = out(await git($, root, ['rev-parse', '-q', '--verify', 'HEAD^']))
   const allowed = new Set(ready)
-  const strays = sha === '' ? [] : (await filesOf($, root, sha)).filter(f => !allowed.has(f))
-  if (sha === '' || parent !== head || strays.length > 0) {
+  const strays = (await filesOf($, root, sha)).filter(f => !allowed.has(f))
+  if (parent !== head || strays.length > 0) {
     if (sha !== '') {
       await git(
         $,
@@ -532,7 +557,7 @@ export async function commitRepo($: EngineInterface, c: Ctx, root: string, paths
         parent === '' ? ['update-ref', '-d', 'HEAD', sha] : ['update-ref', '-m', 'autocommit: rollback', 'HEAD', parent, sha],
       )
     }
-    await clearJournal($, gitDir)
+    await clearJournal($, journal)
     if (strays.length === 0) {
       await alert($, c, name, t.headMoved)
       return none(settled)
@@ -544,7 +569,7 @@ export async function commitRepo($: EngineInterface, c: Ctx, root: string, paths
 
   // The person's index catches up with the new commit for these paths only.
   if (await unstage($, root, ready, true)) {
-    await clearJournal($, gitDir)
+    await clearJournal($, journal)
   } else {
     await alert($, c, name, t.indexStale(ready.slice(0, 3).join(' ')))
   }
@@ -562,7 +587,7 @@ export async function commitRepo($: EngineInterface, c: Ctx, root: string, paths
 // paths the push changes, one per line) filled in. Empty: no check.
 async function prePushCheck($: EngineInterface, c: Ctx, root: string, gitDir: string, files: readonly string[]): Promise<boolean> {
   if (c.cfg.prePushCommand === '') return true
-  const listPath = `${gitDir}/${PUSH_LIST_FILE}`
+  const listPath = `${gitDir}/${PUSH_LIST_FILE}${c.w.tag}`
   await $.fs.write(listPath, `${files.join('\n')}\n`)
   const argv = splitArgs(c.cfg.prePushCommand).map(a => a.split('{root}').join(root).split('{files}').join(listPath))
   if (argv.length === 0) return true
@@ -676,7 +701,8 @@ async function drainOnce($: EngineInterface, c: Ctx): Promise<void> {
 // Never two at once: a call while one runs does nothing (the timer calls
 // again), and a caller that must see its own work through awaits `w.running`.
 export async function drain($: EngineInterface, c: Ctx): Promise<void> {
-  if (c.w.running !== null || ((c.w.queue.size === 0 || c.w.isPaused) && !c.w.isPushAsked)) return
+  if (c.w.running !== null || c.w.gitCommands > 0) return
+  if ((c.w.queue.size === 0 || c.w.isPaused) && !c.w.isPushAsked) return
   const run: Promise<void> = drainOnce($, c).finally(() => {
     if (c.w.running === run) c.w.running = null
   })
@@ -786,7 +812,7 @@ async function squashRepo($: EngineInterface, c: Ctx, root: string, log: readonl
   const summary = isModel && parsed.body !== '' ? [parsed.body, ''] : []
   const body = [...summary, t.squashedHeader, ...subjects.map(x => `- ${x}`)].join('\n')
   const message = commitMessage({ subject, body }, await trailerLines($))
-  const messagePath = `${gitDir}/${MESSAGE_FILE}`
+  const messagePath = `${gitDir}/${MESSAGE_FILE}${c.w.tag}`
   await $.fs.write(messagePath, `${message}\n`)
 
   const made = await git($, root, ['commit-tree', `${head.sha}^{tree}`, ...(base === '' ? [] : ['-p', base]), '-F', messagePath])
@@ -927,6 +953,7 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     w.cwd = normPath(e.cwd)
     w.isInteractive = e.isInteractive
+    w.tag = tagOf(await $.session.id().catch(() => ''))
     // A reload (settings changed, mod updated) picks up what was pending.
     await loadTracking($, c)
     await update($, commits, s => ({ ...s, isBusy: false, pending: pendingCount(w) }))
@@ -979,13 +1006,25 @@ export const register: Register = (on, options) => {
     const command = typeof input.command === 'string' ? input.command : ''
     if (command === '' || input.run_in_background === true || isReadOnlyCommand(command)) return next(e)
 
-    const roots = await watchedRoots($, c, command).catch(() => [] as string[])
-    const before = await Promise.all(roots.map(r => stateOf($, r)))
-    const result = await next(e)
-    if (result.deny !== undefined || result.isReadOnly === true || roots.length === 0) return result
-    const after = await Promise.all(roots.map(r => stateOf($, r)))
-    await recordCommand($, c, agent, roots, before, after).catch(() => undefined)
-    return result
+    // Claude's own git command (a commit, a checkout) never runs beside one
+    // of ours, and none of ours starts while it runs: they would fight over
+    // the index lock, or ours would be built on a HEAD that is gone.
+    const isGit = /\bgit\b/.test(command)
+    if (isGit) {
+      while (w.running !== null) await w.running.catch(() => undefined)
+      w.gitCommands++
+    }
+    try {
+      const roots = await watchedRoots($, c, command).catch(() => [] as string[])
+      const before = await Promise.all(roots.map(r => stateOf($, r)))
+      const result = await next(e)
+      if (result.deny !== undefined || result.isReadOnly === true || roots.length === 0) return result
+      const after = await Promise.all(roots.map(r => stateOf($, r)))
+      await recordCommand($, c, agent, roots, before, after).catch(() => undefined)
+      return result
+    } finally {
+      if (isGit) w.gitCommands--
+    }
   })
 
   on('turn.complete', async ($, e, next) => {
