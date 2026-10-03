@@ -106,8 +106,10 @@ export const changedPaths = (
     .map(([p]) => p)
 
 // Paths `git hash-object --stdin-paths` can read: not deleted on either side.
+// Files git can hash: not deleted, and not a directory (an untracked inner repo
+// shows as `dir/`), since one bad path fails the whole hash-object call.
 export const hashablePaths = (status: ReadonlyMap<string, string>): string[] =>
-  [...status].filter(([, xy]) => !xy.includes('D')).map(([p]) => p)
+  [...status].filter(([p, xy]) => !xy.includes('D') && !p.endsWith('/')).map(([p]) => p)
 
 export const zipHashes = (paths: readonly string[], stdout: string): Map<string, string> | null => {
   const hashes = stdout.split('\n').map(h => h.trim()).filter(h => h !== '')
@@ -118,8 +120,8 @@ export const zipHashes = (paths: readonly string[], stdout: string): Map<string,
 const READ_ONLY_COMMANDS = new Set([
   'cd', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'which', 'echo', 'pwd',
   'test', '[', 'stat', 'du', 'df', 'file', 'date', 'tree', 'type', 'printf',
-  'sort', 'uniq', 'cut', 'tr', 'jq', 'awk', 'basename', 'dirname', 'realpath',
-  'less', 'more', 'diff', 'env', 'whoami', 'uname', 'ps',
+  'sort', 'cut', 'tr', 'jq', 'awk', 'basename', 'dirname', 'realpath',
+  'less', 'more', 'diff', 'whoami', 'uname', 'ps',
   'Get-ChildItem', 'Get-Content', 'Select-String', 'Test-Path', 'Get-Item',
   'Get-Location', 'Resolve-Path', 'Measure-Object', 'Select-Object', 'Where-Object',
 ])
@@ -136,7 +138,10 @@ export const isReadOnlyCommand = (command: string): boolean => {
     .replace(/\d?>\s*\/dev\/null/g, '')
     .replace(/\d?>&\d/g, '')
     .replace(/\d?>\s*\$null/gi, '')
-  if (/[>`]|\$\(|\btee\b|\bxargs\b|\bsed\s+-i|-delete\b|-exec\b|-fprint|\bsh\s+-c|\bbash\s+-c/.test(cleaned)) {
+  if (
+    /[>`]|\$\(|\btee\b|\bxargs\b|\bsed\s+-i|-delete\b|-exec(dir)?\b|-ok(dir)?\b|-fprint|-fls\b|\bsh\s+-c|\bbash\s+-c/.test(cleaned) ||
+    /\bsort\b[^|;&]*\s(-o|--output)\b/.test(cleaned)
+  ) {
     return false
   }
   const segments = cleaned.split(/&&|\|\||[;|\n]/).map(s => s.trim()).filter(s => s !== '')
