@@ -1,0 +1,17 @@
+# Changelog
+
+## 1.0.0 (2026-10-03)
+
+First public release.
+
+- One commit per repo when Claude's turn ends, built in a private git index, with a Conventional Commits
+  message written by Haiku from the diff (configurable model and language).
+- Tracks Claude's own changes only: file edits by path, shell commands by comparing `git status` and content
+  hashes before and after. Read-only commands skip the comparison.
+- Subagents: each agent's files are committed when its own turn ends.
+- Secret guard on every commit and push: over 20 key formats, forbidden file names, new files over 5 MB.
+- Optional bug alerts from the same model call.
+- `/commits` report, `pause`, `resume`, `now`, `undo`, `squash`, `push` (English and French words).
+- Opt-in auto-push per remote, with an optional pre-push command.
+- A bar above the prompt: model, effort, context gauge, Remote Control, commit counters, alerts.
+- Interface in English or French.
