@@ -19,9 +19,7 @@ Claude's work with yours, or a string of `wip` commits. Asking Claude to commit 
 one commit per repo with a Conventional Commits message written from the actual diff, scans it for secrets first,
 and leaves everything else in your working tree exactly as it was.
 
-<p align="center"><img src="docs/demo.gif" alt="A Claude Code session: Claude edits two files, the turn ends, a commit appears with a generated message, a file holding a key is held back" width="100%"></p>
-
-▶ [Watch the 30-second demo with sound (MP4)](docs/demo.mp4)
+https://github.com/user-attachments/assets/188f606e-935e-4aaa-b0c4-e5736469e642
 
 ## Install
 
