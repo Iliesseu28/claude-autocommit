@@ -2,7 +2,7 @@ import type { On } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 import { expect, mock, test } from 'claude-code/testing'
 
-import { barCells, barColor, shortTokens } from './register'
+import { barCells, barColor, forget, newWork, shortTokens, track } from './register'
 
 // A whole session against a git repo held in memory: the hooks below stand
 // for the engine and answer every call the mod makes.
@@ -64,6 +64,9 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
     url: 'git@github.com:me/notes.git',
     isDetached: false,
     commitError: '',
+    // What runs while `git commit` does: a commit from elsewhere, a hook's `git add`.
+    beforeCommit: (): void => undefined,
+    hookAdds: [] as string[],
     staged: new Set<string>(),
     calls: [] as Call[],
     userResets: [] as string[][],
@@ -102,7 +105,8 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
         if (rest.includes('--show-toplevel')) return run(`${ROOT}\n${dir === ROOT ? '' : `${dir.slice(ROOT.length + 1)}/`}\n`)
         if (rest.includes('--absolute-git-dir')) return run(`${GIT_DIR}\n`)
         if (last.endsWith('^')) {
-          const parent = w.commits.get(last.slice(0, -1))?.parent ?? null
+          const ref = last.slice(0, -1)
+          const parent = w.commits.get(ref === 'HEAD' ? w.head : ref)?.parent ?? null
           return parent === null ? run('', 1) : run(`${parent}\n`)
         }
         return run(`${w.head}\n`)
@@ -142,6 +146,8 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
       }
       case 'commit': {
         if (w.commitError !== '') return run('', 1, w.commitError)
+        w.beforeCommit()
+        for (const f of w.hookAdds) w.staged.add(f)
         const files = [...w.staged].sort()
         const sha = nextSha()
         const patch = files.map(f => patchOf(f, w.lines.get(f) ?? [])).join('')
@@ -165,6 +171,9 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
       case 'update-ref': {
         const [, , , to = '', from = ''] = rest
         if (from !== w.head) return run('', 1, 'cannot lock ref HEAD')
+        // Stepping back to the parent leaves the commit's changes in the working tree.
+        const left = w.commits.get(from)
+        if (left?.parent === to) for (const f of left.files) w.status.set(f, ' M')
         w.head = to
         return run()
       }
@@ -448,6 +457,71 @@ test('a refused commit (pre-commit hook) keeps the files pending', async ($, on)
   expect(text).toContain('1 file pending')
 })
 
+test('a commit made elsewhere during ours: ours is rolled back, retried next turn', async ($, on) => {
+  const { w, touch } = fakeWorld(on)
+  await $.session.start(start())
+  const theirs = 'f'.repeat(40)
+  w.beforeCommit = () => {
+    w.commits.set(theirs, { parent: w.head, files: ['mine.md'], patch: '', subject: 'mine' })
+    w.head = theirs
+    w.beforeCommit = () => undefined
+  }
+  touch('a.ts')
+  await $.tool.call(write('a.ts'))
+  await $.turn.complete(turnEnd())
+  // The person's commit stays on top; nothing of theirs went into ours.
+  expect(w.head).toBe(theirs)
+  expect(w.userResets).toEqual([])
+  expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_RESET`)).toBe('')
+  const text = await report($)
+  expect(text).toContain('HEAD moved during the commit, undone; retrying next turn')
+  expect(text).toContain('1 file pending')
+
+  await $.turn.complete(turnEnd())
+  expect(w.commits.get(w.head)?.parent).toBe(theirs)
+  expect(w.commits.get(w.head)?.files).toEqual(['a.ts'])
+})
+
+test('a hook that stages other files: the commit is rolled back, the files left', async ($, on) => {
+  const { w, touch } = fakeWorld(on)
+  await $.session.start(start())
+  w.hookAdds = ['generated.lock']
+  touch('a.ts')
+  await $.tool.call(write('a.ts'))
+  await $.turn.complete(turnEnd())
+  expect(w.head).toBe(BASE)
+  expect(w.status.has('a.ts')).toBe(true)
+  const text = await report($)
+  expect(text).toContain('a git hook staged other files (generated.lock): commit undone, left uncommitted')
+  expect(text).toContain('0 files pending')
+})
+
+test("a subagent's refused files are retried at a later turn end", async ($, on) => {
+  const { w, touch } = fakeWorld(on)
+  await $.session.start(start())
+  w.commitError = 'lint failed'
+  touch('agent.ts')
+  await $.tool.call(write('agent.ts', 'agent-1'))
+  await $.turn.complete(turnEnd('agent-1'))
+  expect(w.head).toBe(BASE)
+
+  w.commitError = ''
+  await $.turn.complete(turnEnd())
+  expect(w.commits.get(w.head)?.files).toEqual(['agent.ts'])
+})
+
+test('a path edited again while its commit is made stays tracked', () => {
+  const w = newWork()
+  track(w, 'main', ROOT, ['a.ts', 'b.ts'])
+  const seen = new Map([
+    [`${ROOT}\0a.ts`, 1],
+    [`${ROOT}\0b.ts`, 1],
+  ])
+  track(w, 'main', ROOT, ['a.ts'])
+  forget(w, ROOT, ['a.ts', 'b.ts'], seen)
+  expect([...(w.tracked.get('main')?.get(ROOT) ?? [])]).toEqual(['a.ts'])
+})
+
 test('nothing is committed mid-rebase or detached, or with .no-auto-commit', async ($, on) => {
   const { w, touch } = fakeWorld(on)
   await $.session.start(start())
@@ -467,12 +541,17 @@ test('nothing is committed mid-rebase or detached, or with .no-auto-commit', asy
 })
 
 test('pause holds the commits, resume sends them', async ($, on) => {
-  const { w, touch, clock } = fakeWorld(on)
+  const { w, touch, clock, callsOf } = fakeWorld(on)
   await $.session.start(start())
   expect(await report($, 'pause')).toBe('Auto-commits paused (files are still tracked).')
   touch('a.ts')
   await $.tool.call(write('a.ts'))
   await $.turn.complete(turnEnd())
+  // The timer does not keep asking git or the model while paused.
+  const statusCalls = callsOf('status').length
+  await clock.advance(10_000)
+  expect(callsOf('status').length).toBe(statusCalls)
+  expect(w.models).toBe(0)
   expect(w.head).toBe(BASE)
   expect(await bandText($)).toContain('paused')
   expect(await report($)).toContain('Auto-commits: PAUSED. 0 commits this session, 0 to push, 1 file pending.')

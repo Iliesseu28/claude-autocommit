@@ -104,7 +104,14 @@ export type Work = {
   repos: Set<string>
   // agents whose turn ended with files to commit
   queue: Set<string>
+  // agents whose last turn is over: their leftovers are retried at any turn end
+  idle: Set<string>
+  // `root\0path` -> how many times it was tracked: a path tracked again while
+  // a drain commits it stays pending for the newer change
+  edits: Map<string, number>
+  // the drain, undo or squash under way: one at a time
   running: Promise<void> | null
+  isPaused: boolean
   isPushAsked: boolean
 }
 
@@ -115,7 +122,10 @@ export const newWork = (): Work => ({
   places: new Map(),
   repos: new Set(),
   queue: new Set(),
+  idle: new Set(),
+  edits: new Map(),
   running: null,
+  isPaused: false,
   isPushAsked: false,
 })
 
@@ -147,11 +157,16 @@ export const pendingCount = (w: Work): number => {
   return all.size
 }
 
+const editKey = (root: string, path: string): string => `${root}\0${path}`
+
 export const track = (w: Work, agent: string, root: string, paths: readonly string[]): void => {
   if (paths.length === 0) return
   const repos = w.tracked.get(agent) ?? new Map<string, Set<string>>()
   const set = repos.get(root) ?? new Set<string>()
-  for (const p of paths) set.add(p)
+  for (const p of paths) {
+    set.add(p)
+    w.edits.set(editKey(root, p), (w.edits.get(editKey(root, p)) ?? 0) + 1)
+  }
   repos.set(root, set)
   w.tracked.set(agent, repos)
   w.repos.delete(root)
@@ -159,14 +174,18 @@ export const track = (w: Work, agent: string, root: string, paths: readonly stri
 }
 
 // Settled paths leave every agent's list: committed, or held back for good.
-export const forget = (w: Work, root: string, paths: readonly string[]): void => {
+// A path tracked again since `seen` was taken keeps its place: its newer
+// change is not in the commit.
+export const forget = (w: Work, root: string, paths: readonly string[], seen?: ReadonlyMap<string, number>): void => {
+  const gone = paths.filter(p => seen === undefined || w.edits.get(editKey(root, p)) === seen.get(editKey(root, p)))
   for (const [agent, repos] of w.tracked) {
     const set = repos.get(root)
     if (set === undefined) continue
-    for (const p of paths) set.delete(p)
+    for (const p of gone) set.delete(p)
     if (set.size === 0) repos.delete(root)
     if (repos.size === 0) w.tracked.delete(agent)
   }
+  for (const p of gone) w.edits.delete(editKey(root, p))
 }
 
 // Mirrors `tracked` and `queue` into the host, and the pending count into the band.
@@ -184,8 +203,12 @@ export async function saveTracking($: EngineInterface, c: Ctx): Promise<void> {
 
 export async function loadTracking($: EngineInterface, c: Ctx): Promise<void> {
   const saved = await read($, tracking)
-  for (const e of saved.pending) track(c.w, e.agent, e.root, e.paths)
+  for (const e of saved.pending) {
+    track(c.w, e.agent, e.root, e.paths)
+    c.w.idle.add(e.agent)
+  }
   for (const agent of saved.queue) if (c.w.tracked.has(agent)) c.w.queue.add(agent)
+  c.w.isPaused = (await read($, commits)).isPaused
 }
 
 export async function alert($: EngineInterface, c: Ctx, repo: string, text: string): Promise<void> {
@@ -232,7 +255,10 @@ export async function trackFile($: EngineInterface, c: Ctx, agent: string, file:
 }
 
 async function statusOf($: EngineInterface, root: string): Promise<Map<string, string> | null> {
-  const r = await git($, root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']).catch(() => null)
+  // A submodule is its own repo: its pointer is never ours to commit.
+  const r = await git($, root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=all']).catch(
+    () => null,
+  )
   return r !== null && r.exitCode === 0 && !r.isStdoutTruncated ? parsePorcelain(r.stdout) : null
 }
 
@@ -331,7 +357,9 @@ export async function recoverJournal($: EngineInterface, root: string, gitDir: s
   if (!(await $.fs.exists(path))) return
   const text = String(await $.fs.read(path).catch(() => ''))
   if (text === '') return
-  const [head = '', ...paths] = text.split('\0').filter(p => p !== '')
+  // The head comes first, empty on a branch with no commit yet.
+  const [head = '', ...rest] = text.split('\0')
+  const paths = rest.filter(p => p !== '')
   const now = out(await git($, root, ['rev-parse', '-q', '--verify', 'HEAD']).catch(() => null))
   // HEAD moved since the journal: the commit was made, its index catch-up was not.
   if (now !== '' && now !== head) await unstage($, root, paths, true)
@@ -381,8 +409,7 @@ async function trailerLines($: EngineInterface): Promise<string[]> {
   return trailers(await read($, attribution), prettyModel(await $.session.model()))
 }
 
-async function messageFor($: EngineInterface, c: Ctx, ready: readonly string[], stat: string, diff: string, isQuick: boolean): Promise<CommitText> {
-  if (isQuick) return { subject: fallbackSubject(ready), body: '', warnings: [] }
+async function messageFor($: EngineInterface, c: Ctx, ready: readonly string[], stat: string, diff: string): Promise<CommitText> {
   const reply = await $.model
     .complete({
       model: c.cfg.commitModel,
@@ -401,21 +428,24 @@ async function messageFor($: EngineInterface, c: Ctx, ready: readonly string[], 
   return safeText(c.cfg.isBugCheck ? parsed : { ...parsed, warnings: [] }, ready)
 }
 
+export type CommitResult = { settled: string[]; sha: string | null }
+
 // One commit of the tracked `paths` in `root`, built in an index of its own:
 // what the scan reads is exactly what the commit holds, and the person's own
 // index is touched only once the commit exists. Resolves the tracked paths
-// settled (committed, already clean, or held back with an alert); the others
-// stay pending.
-export async function commitRepo($: EngineInterface, c: Ctx, root: string, paths: readonly string[], isQuick = false): Promise<string[]> {
+// settled (committed, already clean, or held back with an alert), the others
+// staying pending, and the new commit when one was made.
+export async function commitRepo($: EngineInterface, c: Ctx, root: string, paths: readonly string[]): Promise<CommitResult> {
   const { t } = c
   const name = repoName(root)
-  if (await $.fs.exists(`${root}/.no-auto-commit`)) return [...paths]
+  const none = (settled: string[]): CommitResult => ({ settled, sha: null })
+  if (await $.fs.exists(`${root}/.no-auto-commit`)) return none([...paths])
   const gitDir = await gitDirOf($, root)
-  if (gitDir === null || (await isBusy($, root, gitDir))) return []
+  if (gitDir === null || (await isBusy($, root, gitDir))) return none([])
   await recoverJournal($, root, gitDir)
 
   const status = await statusOf($, root)
-  if (status === null) return []
+  if (status === null) return none([])
   const isCaseInsensitive = out(await git($, root, ['config', '--bool', '--get', 'core.ignorecase'])) === 'true'
   const { found, missing } = matchStatus(paths, status, isCaseInsensitive)
   const settled = [...missing]
@@ -431,7 +461,7 @@ export async function commitRepo($: EngineInterface, c: Ctx, root: string, paths
       await alert($, c, name, reason)
     }
   }
-  if (candidates.length === 0) return settled
+  if (candidates.length === 0) return none(settled)
 
   const env = { GIT_INDEX_FILE: `${gitDir}/${INDEX_FILE}` }
   const head = out(await git($, root, ['rev-parse', '-q', '--verify', 'HEAD']))
@@ -446,7 +476,7 @@ export async function commitRepo($: EngineInterface, c: Ctx, root: string, paths
         })
   if (add.exitCode !== 0) {
     await alert($, c, name, t.prepareFailed(firstLine(add.stderr)))
-    return settled
+    return none(settled)
   }
 
   // Secret scan of exactly what the commit will hold.
@@ -455,24 +485,26 @@ export async function commitRepo($: EngineInterface, c: Ctx, root: string, paths
   const known = new Set(candidates)
   if (findings === null || findings.some(f => !known.has(f.file))) {
     await alert($, c, name, t.scanFailed)
-    return [...settled, ...candidates.flatMap(spellings)]
+    return none([...settled, ...candidates.flatMap(spellings)])
   }
   const flagged = new Set(findings.map(f => f.file))
   for (const f of findings) await alert($, c, name, t.secret(f.file, f.pattern))
   if (flagged.size > 0 && !(await unstage($, root, [...flagged], hasHead, env))) {
     await alert($, c, name, t.dropFailed)
-    return [...settled, ...candidates.flatMap(spellings)]
+    return none([...settled, ...candidates.flatMap(spellings)])
   }
   const ready = candidates.filter(p => !flagged.has(p))
   settled.push(...[...flagged].flatMap(spellings))
-  if (ready.length === 0) return settled
+  if (ready.length === 0) return none(settled)
 
   const diff = (await cachedDiff($, root, ready, '-U3', env)) ?? ''
   const stat = ready.map(p => `${status.get(p) ?? '  '} ${p}`).join('\n')
-  const text = await messageFor($, c, ready, stat, diff, isQuick)
+  const text = await messageFor($, c, ready, stat, diff)
   const messagePath = `${gitDir}/${MESSAGE_FILE}`
   await $.fs.write(messagePath, `${commitMessage(text, await trailerLines($))}\n`)
 
+  // HEAD moved while the message was written: the index is stale, next turn retries.
+  if (out(await git($, root, ['rev-parse', '-q', '--verify', 'HEAD'])) !== head) return none(settled)
   await writeJournal($, gitDir, head, ready)
   // A slow pre-commit hook gets two minutes; the person's hooks always run.
   const commit = await git($, root, ['commit', '-q', '-F', messagePath], { env, timeoutMs: 120_000 }).catch(
@@ -481,7 +513,33 @@ export async function commitRepo($: EngineInterface, c: Ctx, root: string, paths
   if (commit === null || commit.exitCode !== 0) {
     await clearJournal($, gitDir)
     await alert($, c, name, t.commitRefused(firstLine(commit?.stderr || commit?.stdout) || t.timedOut))
-    return settled
+    return none(settled)
+  }
+
+  // The commit must sit on the HEAD its index was built from and hold only the
+  // scanned paths. A HEAD that moved during the commit (a commit from a
+  // terminal, a pull), or a hook that staged more files, would slip other
+  // changes in: the commit is rolled back and the paths stay pending.
+  const sha = out(await git($, root, ['rev-parse', 'HEAD']))
+  const parent = out(await git($, root, ['rev-parse', '-q', '--verify', 'HEAD^']))
+  const allowed = new Set(ready)
+  const strays = sha === '' ? [] : (await filesOf($, root, sha)).filter(f => !allowed.has(f))
+  if (sha === '' || parent !== head || strays.length > 0) {
+    if (sha !== '') {
+      await git(
+        $,
+        root,
+        parent === '' ? ['update-ref', '-d', 'HEAD', sha] : ['update-ref', '-m', 'autocommit: rollback', 'HEAD', parent, sha],
+      )
+    }
+    await clearJournal($, gitDir)
+    if (strays.length === 0) {
+      await alert($, c, name, t.headMoved)
+      return none(settled)
+    }
+    // The hook would do it again on every try: the files are left to the person.
+    await alert($, c, name, t.hookStaged(strays.slice(0, 3).join(', ')))
+    return none([...settled, ...ready.flatMap(spellings)])
   }
 
   // The person's index catches up with the new commit for these paths only.
@@ -490,13 +548,12 @@ export async function commitRepo($: EngineInterface, c: Ctx, root: string, paths
   } else {
     await alert($, c, name, t.indexStale(ready.slice(0, 3).join(' ')))
   }
-  const sha = out(await git($, root, ['rev-parse', 'HEAD']))
   const short = sha.slice(0, 7)
   const entry: CommitLogEntry = { at: Date.now(), root, sha, subject: text.subject, files: ready.length }
   await update($, commits, s => ({ ...s, made: s.made + 1, log: [...s.log, entry].slice(-KEPT_LOG) }))
   $.ui.toast(t.committed(name, short, text.subject), { timeoutMs: 6000 })
   for (const warning of text.warnings) await alert($, c, name, t.bug(short, warning))
-  return [...settled, ...ready.flatMap(spellings)]
+  return { settled: [...settled, ...ready.flatMap(spellings)], sha }
 }
 
 // ---------------------------------------------------------------- push
@@ -573,11 +630,11 @@ async function aheadCount($: EngineInterface, roots: Iterable<string>): Promise<
 
 // Commits what the agents of the queue changed, one commit per repo, then
 // pushes where allowed. A pause holds the commits, never an asked push.
-async function drainOnce($: EngineInterface, c: Ctx, isQuick: boolean): Promise<void> {
+async function drainOnce($: EngineInterface, c: Ctx): Promise<void> {
   const { w } = c
   await update($, commits, s => ({ ...s, isBusy: true }))
   try {
-    if (!(await read($, commits)).isPaused) {
+    if (!w.isPaused) {
       const byRepo = new Map<string, Set<string>>()
       for (const agent of w.queue) {
         for (const [root, paths] of w.tracked.get(agent) ?? []) {
@@ -587,14 +644,19 @@ async function drainOnce($: EngineInterface, c: Ctx, isQuick: boolean): Promise<
         }
       }
       w.queue.clear()
+      // A path edited again while its commit is being made stays tracked.
+      const seen = new Map<string, number>()
+      for (const [root, paths] of byRepo) {
+        for (const p of paths) seen.set(editKey(root, p), w.edits.get(editKey(root, p)) ?? 0)
+      }
 
       for (const [root, paths] of byRepo) {
-        const settled = await commitRepo($, c, root, [...paths], isQuick).catch(async (err: unknown) => {
+        const r = await commitRepo($, c, root, [...paths]).catch(async (err: unknown): Promise<CommitResult> => {
           await alert($, c, repoName(root), c.t.failed(firstLine(String(err))))
-          return [] as string[]
+          return { settled: [], sha: null }
         })
-        forget(w, root, settled)
-        if (!isQuick) await pushRepo($, c, root, false).catch(() => undefined)
+        forget(w, root, r.settled, seen)
+        if (r.sha !== null) await pushRepo($, c, root, false).catch(() => undefined)
       }
     }
 
@@ -613,13 +675,30 @@ async function drainOnce($: EngineInterface, c: Ctx, isQuick: boolean): Promise<
 
 // Never two at once: a call while one runs does nothing (the timer calls
 // again), and a caller that must see its own work through awaits `w.running`.
-export async function drain($: EngineInterface, c: Ctx, isQuick = false): Promise<void> {
-  if (c.w.running !== null || (c.w.queue.size === 0 && !c.w.isPushAsked)) return
-  const run = drainOnce($, c, isQuick).finally(() => {
-    c.w.running = null
+export async function drain($: EngineInterface, c: Ctx): Promise<void> {
+  if (c.w.running !== null || ((c.w.queue.size === 0 || c.w.isPaused) && !c.w.isPushAsked)) return
+  const run: Promise<void> = drainOnce($, c).finally(() => {
+    if (c.w.running === run) c.w.running = null
   })
   c.w.running = run
   await run
+}
+
+// Undo and squash rewrite HEAD: they wait for a running commit, and the next
+// drain waits for them.
+async function exclusive($: EngineInterface, c: Ctx, job: 'undo' | 'squash'): Promise<string> {
+  while (c.w.running !== null) await c.w.running.catch(() => undefined)
+  const run = job === 'undo' ? undoLast($, c) : squashSession($, c)
+  const slot = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  c.w.running = slot
+  try {
+    return await run
+  } finally {
+    if (c.w.running === slot) c.w.running = null
+  }
 }
 
 // ---------------------------------------------------------------- undo, squash
@@ -656,7 +735,7 @@ export async function undoLast($: EngineInterface, c: Ctx): Promise<string> {
   if (moved.exitCode !== 0) return t.undoFailed(name, firstLine(moved.stderr))
   // The index follows HEAD back for these files: their changes show as unstaged.
   if (!(await unstage($, root, files, true))) await alert($, c, name, t.indexStale(files.slice(0, 3).join(' ')))
-  await update($, commits, s => ({ ...s, made: Math.max(0, s.made - 1), log: s.log.slice(0, -1) }))
+  await update($, commits, s => ({ ...s, made: Math.max(0, s.made - 1), log: s.log.filter(e => e.sha !== last.sha) }))
   return t.undone(name, last.sha.slice(0, 7), last.subject, files.length)
 }
 
@@ -884,6 +963,7 @@ export const register: Register = (on, options) => {
   // the status and content of the watched repos before and after it.
   on('tool.call', async ($, e, next) => {
     const agent = e.agentId ?? MAIN
+    w.idle.delete(agent)
     const tool = String(e.tool)
     if (tool === 'Edit' || tool === 'Write' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
       const result = await next(e)
@@ -911,15 +991,21 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     const agent = e.agentId ?? MAIN
-    if (e.reason === 'answer' && w.tracked.has(agent)) {
-      w.queue.add(agent)
+    if (e.reason !== 'answer') return result
+    w.idle.add(agent)
+    // This agent's files, and those an idle agent left pending (a commit
+    // refused or rolled back), whose turn will not end again.
+    for (const a of w.tracked.keys()) {
+      if (w.idle.has(a)) w.queue.add(a)
+    }
+    if (w.queue.size > 0) {
       await saveTracking($, c).catch(() => undefined)
       if (w.isInteractive) {
         drainSoon($, c)
       } else {
         // Without a person (claude -p) the process ends with the turn: commit
         // now, after any run already under way.
-        if (w.running !== null) await w.running.catch(() => undefined)
+        while (w.running !== null) await w.running.catch(() => undefined)
         await drain($, c).catch(() => undefined)
       }
     }
@@ -932,6 +1018,7 @@ export const register: Register = (on, options) => {
       case 'pause':
       case 'resume': {
         const isPaused = action === 'pause'
+        w.isPaused = isPaused
         await update($, commits, s => ({ ...s, isPaused }))
         if (!isPaused) drainSoon($, c)
         return { text: isPaused ? t.isPaused : t.resumed }
@@ -946,14 +1033,10 @@ export const register: Register = (on, options) => {
         w.isPushAsked = true
         drainSoon($, c)
         return { text: t.pushStarted }
-      case 'undo': {
-        if (w.running !== null) await w.running.catch(() => undefined)
-        return { text: await undoLast($, c) }
-      }
-      case 'squash': {
-        if (w.running !== null) await w.running.catch(() => undefined)
-        return { text: await squashSession($, c) }
-      }
+      case 'undo':
+        return { text: await exclusive($, c, 'undo') }
+      case 'squash':
+        return { text: await exclusive($, c, 'squash') }
       default: {
         const s = await read($, commits)
         await update($, commits, x => ({ ...x, unseen: 0 }))
