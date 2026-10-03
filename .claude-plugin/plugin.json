@@ -1,0 +1,67 @@
+{
+  "name": "autocommit",
+  "version": "1.0.0",
+  "description": "Turns every turn Claude takes into a clean git commit: only the files that turn changed, a Conventional Commits message written by Haiku, a secret scan before every commit, undo and squash. Plus a band above the prompt with model, effort, context and commits.",
+  "author": {
+    "name": "Iliesseu28",
+    "email": "iliesseu28@users.noreply.github.com"
+  },
+  "homepage": "https://github.com/Iliesseu28/claude-autocommit",
+  "repository": "https://github.com/Iliesseu28/claude-autocommit",
+  "license": "MIT",
+  "keywords": ["git", "commit", "auto-commit", "conventional-commits", "secrets", "mod", "status-line", "aider"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Language of the band, notifications and /commits (en or fr). Commit messages follow commitLanguage.",
+      "default": "en",
+      "options": ["en", "fr"]
+    },
+    "commitModel": {
+      "type": "string",
+      "title": "Commit message model",
+      "description": "Model that writes commit messages and spots obvious bugs.",
+      "default": "haiku",
+      "options": ["haiku", "sonnet", "opus"]
+    },
+    "commitLanguage": {
+      "type": "string",
+      "title": "Commit message language",
+      "description": "Language of commit subjects and bodies, for example English, French, German.",
+      "default": "English"
+    },
+    "bugCheck": {
+      "type": "boolean",
+      "title": "Flag likely bugs",
+      "description": "Warn when a committed diff holds an obvious bug (debug leftover, broken reference, half-finished code).",
+      "default": true
+    },
+    "autoPush": {
+      "type": "string",
+      "title": "Auto-push remotes",
+      "description": "Comma-separated remotes pushed after each auto-commit, for example me/notes, github.com/me/dotfiles, or * for all. Empty: never push on its own (/commits push still works).",
+      "default": ""
+    },
+    "prePushCommand": {
+      "type": "string",
+      "title": "Pre-push check",
+      "description": "Command run before any push; a non-zero exit blocks it. {root} is the repo, {files} a file listing the changed paths. Example: gitleaks git {root} --log-opts=@{u}..HEAD",
+      "default": ""
+    },
+    "bar": {
+      "type": "string",
+      "title": "Band above the prompt",
+      "description": "full: model, effort, context, Remote Control, commits. compact: context and commits. off: no band.",
+      "default": "full",
+      "options": ["full", "compact", "off"]
+    },
+    "maxFilesPerCommand": {
+      "type": "number",
+      "title": "Max files per shell command",
+      "description": "A shell command that changes more files than this at once (a formatter, a codegen) is not auto-committed; an alert says so.",
+      "default": 40
+    }
+  }
+}

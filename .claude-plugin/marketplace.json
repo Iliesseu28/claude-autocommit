@@ -1,0 +1,16 @@
+{
+  "name": "claude-autocommit",
+  "description": "Claude Code commits its own work: one clean commit per turn, nothing that was not Claude's",
+  "owner": {
+    "name": "Iliesseu28",
+    "email": "iliesseu28@users.noreply.github.com"
+  },
+  "plugins": [
+    {
+      "name": "autocommit",
+      "description": "Every turn Claude takes becomes a clean, reviewable git commit: only the files it changed, a Haiku-written Conventional Commits message, a secret scan, undo and squash",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
