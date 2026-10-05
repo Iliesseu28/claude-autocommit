@@ -42,7 +42,7 @@ const run = (stdout = '', exitCode = 0, stderr = '') => ({
   isStderrTruncated: false,
 })
 
-type Commit = { parent: string | null; files: string[]; patch: string; subject: string; tree?: string }
+type Commit = { parent: string | null; files: string[]; patch: string; subject: string; tree?: string; message?: string }
 type Call = { args: string[]; stdin: string; isTempIndex: boolean }
 
 const patchOf = (file: string, lines: readonly string[]): string =>
@@ -82,9 +82,17 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
     checkExit: 0,
     files: new Map<string, string>(),
     markers: new Set<string>(),
+    // Files the mod deleted, and what the pre-push check found in its list.
+    removed: [] as string[],
+    listSeen: [] as string[],
     toasts: [] as string[],
     models: 0,
+    prompts: [] as string[],
     warnings: [] as string[],
+    // The subjects `git log --format=%s` lists, newest first.
+    recent: [] as string[],
+    // Raw porcelain entries of the person's index the mod never tracks.
+    extraStatus: '',
     onBash: (_command: string): void => undefined,
   }
 
@@ -100,10 +108,12 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
   }
   const unpushed = (): string[] => chain().filter(s => !w.pushed.has(s))
   const nextSha = (): string => String(++w.count).repeat(40).slice(0, 40)
-  const subjectAt = (path: string): string => (w.files.get(path) ?? '').split('\n')[0] ?? ''
+  // A message comes from standard input (`-F -`) or a file.
+  const messageOf = (from: string, stdin: string): string => (from === '-' ? stdin : (w.files.get(from) ?? ''))
   const callsOf = (sub: string): Call[] => w.calls.filter(c => c.args[0] === sub)
 
-  const git = (dir: string, args: string[], stdin: string, isTempIndex: boolean) => {
+  const git = (dir: string, args: string[], stdin: string, index: string | undefined) => {
+    const isTempIndex = index !== undefined
     w.calls.push({ args, stdin, isTempIndex })
     if (dir !== ROOT && !dir.startsWith(`${ROOT}/`)) return run('', 128, 'fatal: not a git repository')
     const [sub = '', ...rest] = args
@@ -130,11 +140,13 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
       case 'remote':
         return run(`${w.url}\n`)
       case 'status':
-        return run([...w.status].map(([p, xy]) => `${xy} ${p}\0`).join(''))
+        return run([...w.status].map(([p, xy]) => `${xy} ${p}\0`).join('') + w.extraStatus)
       case 'hash-object':
         return run(`${stdin.split('\n').filter(p => p !== '').map(p => `h${w.versions.get(p) ?? 0}`).join('\n')}\n`)
       case 'read-tree':
         w.staged.clear()
+        // git writes the index file it is pointed at.
+        if (index !== undefined) w.files.set(posix(index), 'index')
         return run()
       case 'add':
         for (const p of stdin.split('\0')) w.staged.add(p)
@@ -160,7 +172,9 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
         const files = [...w.staged].sort()
         const sha = nextSha()
         const patch = files.map(f => patchOf(f, w.lines.get(f) ?? [])).join('')
-        w.commits.set(sha, { parent: w.head, files, patch, subject: subjectAt(last), tree: `tree-${sha}` })
+        const message = messageOf(last, stdin)
+        const subject = message.split('\n')[0] ?? ''
+        w.commits.set(sha, { parent: w.head, files, patch, subject, message, tree: `tree-${sha}` })
         w.indexTree = `tree-${sha}`
         w.head = sha
         for (const f of files) w.status.delete(f)
@@ -179,7 +193,8 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
           for (const f of w.commits.get(s)?.files ?? []) files.add(f)
         }
         const sha = nextSha()
-        w.commits.set(sha, { parent: base, files: [...files].sort(), patch: '', subject: subjectAt(last) })
+        const message = messageOf(last, stdin)
+        w.commits.set(sha, { parent: base, files: [...files].sort(), patch: '', subject: message.split('\n')[0] ?? '', message })
         return run(`${sha}\n`)
       }
       case 'update-ref': {
@@ -198,6 +213,7 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
         return run(chain().slice(0, max).join('\n'))
       }
       case 'log':
+        if (rest.includes('--format=%s')) return run(w.recent.map(r => `${r}\n`).join(''))
         return run(unpushed().map(s => w.commits.get(s)?.patch ?? '').join(''))
       case 'diff-tree':
         return run((w.commits.get(last)?.files ?? []).join('\0'))
@@ -229,8 +245,11 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
     return { value: undefined }
   })
   on('fs.stat', () => ({ value: { kind: 'file' as const, size: 40, mtimeMs: 0, isLink: false } }))
+  on('env.get', () => ({ value: undefined }))
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('model.complete', (_$, e) => {
     w.models++
+    w.prompts.push(e.prompt)
     const text = (e.system ?? '').startsWith('You merge')
       ? '{"subject":"feat: add the three notes","body":"Grouped the session work."}'
       : JSON.stringify({ subject: 'feat: update the notes', body: '', warnings: w.warnings })
@@ -257,13 +276,21 @@ function fakeWorld(on: On, surfaces: readonly string[] = ['terminal']) {
   })
   on('process.run', (_$, e) => {
     const argv = [...e.argv]
+    if (argv[0] === 'rm') {
+      for (const path of argv.slice(3)) {
+        w.removed.push(posix(path))
+        w.files.delete(posix(path))
+      }
+      return { value: run() }
+    }
     if (argv[0] !== 'git') {
       w.checks.push(argv)
+      w.listSeen.push(w.files.get(posix(argv[argv.length - 1] ?? '')) ?? '')
       return { value: run('', w.checkExit, w.checkExit === 0 ? '' : 'check failed') }
     }
     const at = argv.indexOf('-C')
     return {
-      value: git(argv[at + 1] ?? '', argv.slice(at + 2), e.init?.stdin ?? '', e.init?.env?.GIT_INDEX_FILE !== undefined),
+      value: git(argv[at + 1] ?? '', argv.slice(at + 2), e.init?.stdin ?? '', e.init?.env?.GIT_INDEX_FILE),
     }
   })
 
@@ -376,11 +403,8 @@ test('end of turn: one commit of the session files, secret and .env held back', 
   await $.turn.complete(turnEnd())
 
   // Built in an index of its own: the .env never reaches it, the leak is dropped.
-  // Seeded from HEAD, emptied once committed so a session leaves a tiny file.
-  expect(callsOf('read-tree').map(c => [c.args[1], c.isTempIndex])).toEqual([
-    ['HEAD', true],
-    ['--empty', true],
-  ])
+  // Seeded from HEAD, deleted once used.
+  expect(callsOf('read-tree').map(c => [c.args[1], c.isTempIndex])).toEqual([['HEAD', true]])
   expect(callsOf('add').map(c => [c.stdin.split('\0').sort(), c.isTempIndex])).toEqual([[['src/a.ts', 'src/leak.ts'], true]])
   expect(callsOf('commit').map(c => c.isTempIndex)).toEqual([true])
   expect(w.commits.get(w.head)?.files).toEqual(['src/a.ts'])
@@ -389,13 +413,13 @@ test('end of turn: one commit of the session files, secret and .env held back', 
   // The foreign file and the held-back ones stay as they were.
   expect([...w.status.keys()].sort()).toEqual(['.env', 'other.ts', 'src/leak.ts'])
 
-  const message = w.files.get(`${GIT_DIR}/AUTOCOMMIT_MSG${TAG}`) ?? ''
+  const message = w.commits.get(w.head)?.message ?? ''
   expect(message).toContain('feat: update the notes')
   expect(message).toContain('Auto-commit: claude-autocommit')
   expect(message).toContain('Co-Authored-By: Bot <bot@example.com>')
   expect(message).not.toContain('noreply@anthropic.com')
   expect(message).not.toContain(KEY)
-  expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_RESET${TAG}`)).toBe('')
+  expect(w.files.has(`${GIT_DIR}/AUTOCOMMIT_RESET${TAG}`)).toBe(false)
   expect(w.toasts).toContain('✓ repo 1111111  feat: update the notes')
 
   expect(await bandText($)).toContain('⚠ 3')
@@ -416,7 +440,7 @@ test('the default trailer names the session model', async ($, on) => {
   touch('a.ts')
   await $.tool.call(write('a.ts'))
   await $.turn.complete(turnEnd())
-  expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_MSG${TAG}`)).toContain('Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>')
+  expect(w.commits.get(w.head)?.message).toContain('Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>')
 })
 
 test('shell commands: changes are found by comparing the repo before and after', { options: { maxFilesPerCommand: 3 } }, async ($, on) => {
@@ -448,7 +472,7 @@ test('shell commands: changes are found by comparing the repo before and after',
   expect(await report($)).toContain('a command changed 4 files at once, not auto-committed')
 })
 
-test("a subagent's files wait for the end of its own turn", async ($, on) => {
+test("headless: a subagent's files wait for the end of its own turn, not the main one's", async ($, on) => {
   const { w, touch } = fakeWorld(on)
   await $.session.start(start())
   touch('main.ts')
@@ -467,6 +491,146 @@ test("a subagent's files wait for the end of its own turn", async ($, on) => {
   expect(await report($)).toContain('2 commits this session, 0 to push, 0 files pending')
 })
 
+test('a subagent done while the main turn works waits for it, then gets a commit of its own', async ($, on) => {
+  const { w, touch, clock, chain } = fakeWorld(on)
+  await $.session.start(start(true))
+  await $.turn.start({ text: 'go', turnId: 't' })
+  touch('main.ts')
+  await $.tool.call(write('main.ts'))
+  touch('agent.ts')
+  await $.tool.call(write('agent.ts', 'agent-1'))
+  // The subagent is done, the main loop is not: nothing is committed yet.
+  await $.turn.complete(turnEnd('agent-1'))
+  await clock.advance(5000)
+  expect(w.head).toBe(BASE)
+  expect(await report($)).toContain('2 files pending')
+
+  await $.turn.complete(turnEnd())
+  await clock.advance(100)
+  // One commit per agent, each with its own message.
+  expect(chain()).toHaveLength(3)
+  expect(w.commits.get(w.head)?.files).toEqual(['agent.ts'])
+  expect(w.commits.get(w.commits.get(w.head)?.parent ?? '')?.files).toEqual(['main.ts'])
+  expect(w.models).toBe(2)
+})
+
+test("a subagent's files Claude committed itself meanwhile: no auto-commit, no alert", async ($, on) => {
+  const { w, touch, clock, callsOf } = fakeWorld(on)
+  await $.session.start(start(true))
+  await $.turn.start({ text: 'go', turnId: 't' })
+  touch('agent.ts')
+  await $.tool.call(write('agent.ts', 'agent-1'))
+  await $.turn.complete(turnEnd('agent-1'))
+  await clock.advance(3000)
+  expect(w.head).toBe(BASE)
+
+  // The main loop commits the subagent's work by hand, with its own message.
+  const mine = 'a'.repeat(40)
+  w.onBash = () => {
+    w.commits.set(mine, { parent: w.head, files: ['agent.ts'], patch: '', subject: 'feat(search): add the morning search' })
+    w.head = mine
+    w.status.delete('agent.ts')
+  }
+  await $.tool.call({ tool: 'Bash', command: 'git commit -qm "feat(search): add the morning search" -- agent.ts' })
+  await $.turn.complete(turnEnd())
+  await clock.advance(100)
+
+  expect(w.head).toBe(mine)
+  expect(callsOf('commit')).toEqual([])
+  expect(w.models).toBe(0)
+  const text = await report($)
+  expect(text).toContain('0 commits this session, 0 to push, 0 files pending')
+  expect(text).not.toContain('Alerts:')
+})
+
+test('a subagent that ends after the main turn is committed at once', async ($, on) => {
+  const { w, touch, clock } = fakeWorld(on)
+  await $.session.start(start(true))
+  await $.turn.start({ text: 'go', turnId: 't' })
+  touch('main.ts')
+  await $.tool.call(write('main.ts'))
+  await $.turn.complete(turnEnd())
+  await clock.advance(100)
+  expect(w.commits.get(w.head)?.files).toEqual(['main.ts'])
+
+  // Run in the background, it finishes once the main loop is idle.
+  touch('agent.ts')
+  await $.tool.call(write('agent.ts', 'agent-1'))
+  await $.turn.complete(turnEnd('agent-1'))
+  await clock.advance(100)
+  expect(w.commits.get(w.head)?.files).toEqual(['agent.ts'])
+})
+
+test('headless: a subagent done while the main turn works is committed at once', async ($, on) => {
+  const { w, touch } = fakeWorld(on)
+  await $.session.start(start())
+  await $.turn.start({ text: 'go', turnId: 't' })
+  touch('agent.ts')
+  await $.tool.call(write('agent.ts', 'agent-1'))
+  await $.turn.complete(turnEnd('agent-1'))
+  expect(w.commits.get(w.head)?.files).toEqual(['agent.ts'])
+})
+
+test("the model sees the repo's latest subjects written by hand", async ($, on) => {
+  const { w, touch, callsOf } = fakeWorld(on)
+  w.recent = ['docs(rag): cite the sources', `fix(api): ${'x'.repeat(100)}`]
+  await $.session.start(start())
+  touch('a.ts')
+  await $.tool.call(write('a.ts'))
+  await $.turn.complete(turnEnd())
+  // One git call: the last 8 subjects, auto-commits left out.
+  expect(callsOf('log').map(c => c.args)).toEqual([['log', '-8', '--format=%s', '--invert-grep', '--grep=^Auto-commit:']])
+  const prompt = w.prompts[0] ?? ''
+  expect(prompt).toContain('Recent subjects in this repo')
+  expect(prompt).toContain('- docs(rag): cite the sources')
+  expect(prompt).toContain(`- fix(api): ${'x'.repeat(62)}\n`)
+})
+
+test('a stale index is reported once per repo, from 10 entries', async ($, on) => {
+  const { w, touch } = fakeWorld(on)
+  // Staged versions that differ from the disk, and staged deletions of files still there.
+  const stale = (n: number): string =>
+    Array.from({ length: n }, (_, i) => (i % 2 === 0 ? `MM s${i}.md\0` : `D  s${i}.md\0?? s${i}.md\0`)).join('')
+  await $.session.start(start())
+  const turn = async (file: string): Promise<void> => {
+    touch(file)
+    await $.tool.call(write(file))
+    await $.turn.complete(turnEnd())
+  }
+  w.extraStatus = stale(9)
+  await turn('a.ts')
+  expect(await report($)).not.toContain("git's index holds")
+
+  w.extraStatus = stale(10)
+  await turn('b.ts')
+  expect(await report($)).toContain("git's index holds 10 staged entries that differ from the files on disk")
+
+  w.extraStatus = stale(12)
+  await turn('c.ts')
+  expect(w.toasts.filter(t => t.includes("git's index holds"))).toHaveLength(1)
+  // The person's index is never touched for it.
+  expect(w.userResets).toEqual([['a.ts'], ['b.ts'], ['c.ts']])
+})
+
+test('nothing of the mod stays in .git: message by stdin, index and journal deleted', async ($, on) => {
+  const { w, touch, callsOf } = fakeWorld(on)
+  await $.session.start(start())
+  touch('a.ts')
+  await $.tool.call(write('a.ts'))
+  await $.turn.complete(turnEnd())
+  expect(callsOf('commit').map(c => [c.args.slice(-2), c.stdin.split('\n')[0]])).toEqual([[['-F', '-'], 'feat: update the notes']])
+  expect([...w.files.keys()].filter(k => k.startsWith(`${GIT_DIR}/`))).toEqual([])
+  expect(w.removed).toContain(`${GIT_DIR}/autocommit.index${TAG}`)
+  expect(w.removed).toContain(`${GIT_DIR}/AUTOCOMMIT_RESET${TAG}`)
+
+  // A refused commit leaves nothing either.
+  w.commitError = 'lint failed'
+  touch('b.ts')
+  await $.tool.call(write('b.ts'))
+  await $.turn.complete(turnEnd())
+  expect([...w.files.keys()].filter(k => k.startsWith(`${GIT_DIR}/`))).toEqual([])
+})
+
 test('a refused commit (pre-commit hook) keeps the files pending', async ($, on) => {
   const { w, touch } = fakeWorld(on)
   await $.session.start(start())
@@ -475,7 +639,7 @@ test('a refused commit (pre-commit hook) keeps the files pending', async ($, on)
   await $.tool.call(write('a.ts'))
   await $.turn.complete(turnEnd())
   expect(w.head).toBe(BASE)
-  expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_RESET${TAG}`)).toBe('')
+  expect(w.files.has(`${GIT_DIR}/AUTOCOMMIT_RESET${TAG}`)).toBe(false)
   const text = await report($)
   expect(text).toContain('commit refused (lint failed: 2 errors)')
   expect(text).toContain('1 file pending')
@@ -496,7 +660,7 @@ test('a commit made elsewhere during ours: ours is rolled back, retried next tur
   // The person's commit stays on top; nothing of theirs went into ours.
   expect(w.head).toBe(theirs)
   expect(w.userResets).toEqual([])
-  expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_RESET${TAG}`)).toBe('')
+  expect(w.files.has(`${GIT_DIR}/AUTOCOMMIT_RESET${TAG}`)).toBe(false)
   const text = await report($)
   expect(text).toContain('HEAD moved during the commit, undone; retrying next turn')
   expect(text).toContain('1 file pending')
@@ -638,7 +802,7 @@ test('squash folds the session commits into one, undo steps back', async ($, on)
   expect(await report($, 'squash')).toBe('repo: 3 auto-commits squashed into 4444444 "feat: add the three notes".')
   expect(callsOf('commit-tree')[0]?.args.slice(0, 4)).toEqual(['commit-tree', `${third}^{tree}`, '-p', BASE])
   expect(chain()).toEqual(['4'.repeat(40), BASE])
-  const message = w.files.get(`${GIT_DIR}/AUTOCOMMIT_MSG${TAG}`) ?? ''
+  const message = w.commits.get(w.head)?.message ?? ''
   expect(message).toContain('Squashed commits:\n- feat: update the notes')
   expect(await bandText($)).toContain('1 auto')
 
@@ -676,7 +840,10 @@ test(
     await $.turn.complete(turnEnd())
 
     expect(w.checks).toEqual([['check-secrets', ROOT, '--list', `${GIT_DIR}/AUTOCOMMIT_PUSH_LIST${TAG}`]])
-    expect(w.files.get(`${GIT_DIR}/AUTOCOMMIT_PUSH_LIST${TAG}`)).toBe('a.ts\n')
+    expect(w.listSeen).toEqual(['a.ts\n'])
+    // Nothing of the mod's is left in .git: no message file, index, journal or list.
+    expect([...w.files.keys()].filter(k => k.startsWith(`${GIT_DIR}/`))).toEqual([])
+    expect(w.removed).toContain(`${GIT_DIR}/AUTOCOMMIT_PUSH_LIST${TAG}`)
     expect(callsOf('push').map(c => c.args)).toEqual([['push', '--quiet', 'origin', 'HEAD:refs/heads/main']])
     expect(w.toasts).toContain('↑ repo: 1 commit pushed')
 

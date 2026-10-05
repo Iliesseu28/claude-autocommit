@@ -4,6 +4,9 @@ export type CommitText = { subject: string; body: string; warnings: string[] }
 export type DiffPart = { file: string; text: string }
 
 const MAX_SUBJECT = 72
+export const RECENT_SUBJECTS = 8
+// Stale entries in the person's index from which it is worth a warning.
+export const STALE_INDEX_MIN = 10
 const MAX_DIFF_CHARS = 12_000
 const MAX_FILE_DIFF_CHARS = 3_000
 
@@ -104,6 +107,28 @@ export const changedPaths = (
       return h0 === undefined || h1 === undefined ? was !== xy : h0 !== h1
     })
     .map(([p]) => p)
+
+// Entries of the person's own index that look left over from an older state
+// of the repo, read from `git status --porcelain=v1 -z` of that index: a
+// staged change (X is M or A) whose file differs again on disk (Y not blank),
+// or a staged deletion (X is D) of a file still on disk (listed again as
+// untracked). A few are ordinary work in progress; many at once is the mark
+// of a `.git/index` that a folder sync copied back from another machine.
+export const staleIndexCount = (z: string): number => {
+  const entries: Array<[string, string]> = []
+  const parts = z.split('\0')
+  for (let i = 0; i < parts.length; i += 1) {
+    const entry = parts[i]
+    if (entry === undefined || entry.length < 4) continue
+    const xy = entry.slice(0, 2)
+    entries.push([xy, entry.slice(3)])
+    if (xy[0] === 'R' || xy[0] === 'C') i += 1
+  }
+  const untracked = new Set(entries.filter(([xy]) => xy === '??').map(([, p]) => p))
+  return entries.filter(
+    ([xy, p]) => ((xy[0] === 'M' || xy[0] === 'A') && xy[1] !== ' ') || (xy[0] === 'D' && untracked.has(p)),
+  ).length
+}
 
 // Paths `git hash-object --stdin-paths` can read: not deleted on either side.
 // Files git can hash: not deleted, and not a directory (an untracked inner repo
@@ -210,7 +235,9 @@ export const commitSystem = (o: PromptOptions): string =>
   [
     'You write git commit messages' + (o.isBugCheck ? ' and spot obvious bugs in a diff.' : '.'),
     'Reply with JSON only, no code fence: {"subject": string, "body": string, "warnings": string[]}.',
-    `subject: Conventional Commits (feat, fix, refactor, docs, chore, test, style, perf, build, ci), optional scope, imperative, in ${o.commitLanguage}, at most 72 characters.`,
+    `subject: imperative, in ${o.commitLanguage}, at most 72 characters.`,
+    "When the prompt lists the repo's recent subjects, write yours in their style: the same type words, a scope in parentheses whenever they use one (picked from the changed files), the same capitalization.",
+    'Without them, Conventional Commits (feat, fix, refactor, docs, chore, test, style, perf, build, ci), optional scope.',
     `body: one to three short lines in ${o.commitLanguage} on WHY the change was made; empty string when obvious.`,
     o.isBugCheck
       ? `warnings: at most 2 items, in ${o.warningLanguage}, only for a likely real bug you can point to (debug leftover, broken reference, syntax error, half-finished code, deleted code still used). Empty array when nothing is clearly wrong.`
@@ -218,8 +245,23 @@ export const commitSystem = (o: PromptOptions): string =>
     'Never use the characters \u2014 or \u2013.',
   ].join(' ')
 
-export const commitPrompt = (stat: string, diff: string): string =>
-  `Files changed:\n${stat.trim()}\n\nDiff:\n${trimDiff(diff)}`
+// The subjects of the repo's latest commits, one per line, newest first, each
+// cut to a subject's length: the style the model copies.
+export const recentSubjects = (stdout: string): string[] =>
+  stdout
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l !== '')
+    .slice(0, RECENT_SUBJECTS)
+    .map(l => l.slice(0, MAX_SUBJECT))
+
+export const commitPrompt = (stat: string, diff: string, recent: readonly string[] = []): string => {
+  const style =
+    recent.length === 0
+      ? ''
+      : `Recent subjects in this repo, newest first (copy their style, not their content):\n${recent.map(r => `- ${r}`).join('\n')}\n\n`
+  return `${style}Files changed:\n${stat.trim()}\n\nDiff:\n${trimDiff(diff)}`
+}
 
 export const squashSystem = (commitLanguage: string): string =>
   [

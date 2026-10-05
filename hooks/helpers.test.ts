@@ -5,6 +5,7 @@ import {
   changedPaths,
   commandDirs,
   commitMessage,
+  commitPrompt,
   commitSystem,
   fallbackSubject,
   isReadOnlyCommand,
@@ -14,7 +15,9 @@ import {
   parseCommitReply,
   parsePorcelain,
   prettyModel,
+  recentSubjects,
   splitArgs,
+  staleIndexCount,
   splitDiff,
   trailers,
   trimDiff,
@@ -138,6 +141,24 @@ test('prompts carry the configured languages', () => {
   )
   const big = `diff --git a/x b/x\n${'+line\n'.repeat(2000)}`
   expect(trimDiff(big).length < 3_100).toBe(true)
+})
+
+test('recent subjects: at most 8, each cut to 72 characters, listed before the diff', () => {
+  const log = `${Array.from({ length: 10 }, (_, i) => `feat(s${i}): change ${i}`).join('\n')}\n\n`
+  expect(recentSubjects(log)).toHaveLength(8)
+  expect(recentSubjects(`docs: ${'y'.repeat(90)}\n`)[0]).toHaveLength(72)
+  expect(recentSubjects('')).toEqual([])
+  const prompt = commitPrompt(' a.ts | 2 +-', 'diff', ['docs(rag): cite the sources'])
+  expect(prompt.indexOf('- docs(rag): cite the sources') < prompt.indexOf('Files changed:')).toBe(true)
+  expect(commitPrompt(' a.ts | 2 +-', 'diff')).not.toContain('Recent subjects')
+  expect(commitSystem({ commitLanguage: 'English', warningLanguage: 'English', isBugCheck: false })).toContain('recent subjects')
+})
+
+test('stale index: staged entries that differ from the disk, staged deletions of files still there', () => {
+  // MM: staged then changed again. D + ??: deleted in the index, still on disk. AD: added then deleted.
+  expect(staleIndexCount('MM a\0D  b\0AD d\0?? b\0 M c\0A  e\0D  f\0')).toBe(3)
+  expect(staleIndexCount('R  new\0old\0RM n2\0o2\0')).toBe(0)
+  expect(staleIndexCount('')).toBe(0)
 })
 
 test('prettyModel', () => {

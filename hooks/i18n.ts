@@ -36,6 +36,8 @@ const en = {
   headRaced: 'another commit landed right after the auto-commit: check git log',
   hookStaged: (files: string) => `a git hook staged other files (${files}): commit undone, left uncommitted`,
   indexStale: (paths: string) => `index not refreshed, run: git reset -q -- ${paths}`,
+  staleIndex: (n: number) =>
+    `git's index holds ${n} staged entries that differ from the files on disk, often an old index a folder sync copied back. A plain git commit would commit them all. See them: git diff --cached --stat. Not wanted: git reset -q (files on disk untouched). Or commit by naming files: git commit -- <files>`,
   bug: (sha: string, text: string) => `possible bug (${sha}): ${text}`,
   tooManyFiles: (n: number) => `a command changed ${n} files at once, not auto-committed`,
   failed: (err: string) => `auto-commit error (${err})`,
@@ -115,6 +117,8 @@ const fr: Strings = {
   headRaced: 'un autre commit est arrivé juste après le commit auto : vérifier git log',
   hookStaged: files => `un hook git a ajouté d'autres fichiers (${files}) : commit annulé, laissés non commités`,
   indexStale: paths => `index pas mis à jour, lancer : git reset -q -- ${paths}`,
+  staleIndex: n =>
+    `l'index git contient ${n} entrées indexées qui diffèrent des fichiers sur le disque, souvent un vieil index recopié par une synchro de dossier. Un simple git commit les commiterait toutes. Les voir : git diff --cached --stat. Pas voulu : git reset -q (les fichiers sur le disque ne bougent pas). Ou commiter en nommant les fichiers : git commit -- <fichiers>`,
   bug: (sha, text) => `bug possible (${sha}) : ${text}`,
   tooManyFiles: n => `une commande a changé ${n} fichiers d'un coup, pas de commit auto pour eux`,
   failed: err => `erreur du commit auto (${err})`,
