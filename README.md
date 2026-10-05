@@ -16,8 +16,9 @@ Claude's work with yours, or a string of `wip` commits. Asking Claude to commit 
 `git add -A` whatever is lying around.
 
 **autocommit** is a Claude Code mod that watches which files Claude itself changes. When the turn ends, it makes
-one commit per repo with a message written from the actual diff in the style of your recent commits, scans it for secrets first,
-and leaves everything else in your working tree exactly as it was.
+one commit per repo, and one per agent when subagents worked too, with a message written from the actual diff in the
+style of your recent commits, scans each one for secrets first, and leaves everything else in your working tree exactly
+as it was.
 
 https://github.com/user-attachments/assets/188f606e-935e-4aaa-b0c4-e5736469e642
 
@@ -39,14 +40,14 @@ on Windows 11 and in headless `claude -p` runs.
 
 | | |
 |---|---|
-| **One commit per turn, per repo** | Claude's changes land as soon as its answer is done, about two seconds later. |
+| **One commit per turn, per repo, per agent** | Claude's changes land as soon as its answer is done, about two seconds later. |
 | **Only Claude's files** | An edit is tracked by its path. A shell command is judged by comparing `git status` and file contents before and after it. Your own edits in the same repo stay out. |
 | **A message from the diff** | Haiku writes the subject in the style of the repo's last hand-written subjects (type words, scope, capitalization; Conventional Commits when there are none) and one to three lines on *why*, in the language you pick. |
 | **A second pair of eyes** | The same call flags obvious slips in the diff (debug leftover, broken reference, half-finished code) as an alert. |
 | **A secret guard** | Every commit and every push is scanned: over 20 key formats, `.env`, `.pem`, `.p8`, `.p12`, SSH keys, service accounts. A flagged file is never committed. |
 | **Your index untouched** | Commits are built in a private git index. Whatever you had staged stays staged. |
-| **Subagents handled** | A subagent that finishes while Claude is still working waits for the end of Claude's turn, then gets a commit of its own. Files Claude already committed by hand are left alone. |
-| **A stale index warning** | When git's own index holds 10 or more staged entries that differ from the disk (often an old index a folder sync copied back), one alert per repo says how to see and clear them. Your index is never changed. |
+| **Subagents handled** | A subagent that finishes while Claude is still working waits for the end of Claude's turn (even one you interrupt), then gets a commit of its own. Files Claude already committed by hand are left alone. |
+| **A stale index warning** | When git's own index holds 10 or more staged entries that differ from the disk (often an old index a folder sync copied back), one alert per repo says how to see and clear them. Files the mod is about to commit itself are not counted. Your index is never changed. |
 | **Undo, squash, push** | `/commits undo`, `/commits squash`, `/commits push`. |
 | **A status bar** | Model, effort, context gauge, Remote Control, and the commit counters, above the prompt. |
 
@@ -119,12 +120,11 @@ To keep a repo out entirely, create an empty `.no-auto-commit` file at its root 
 
 ## Honest limits
 
-- During a shell command, the mod compares the repo before and after. A file **you** save in your editor while that
-  command runs looks like the command's work and will be committed with it.
+- During a shell command, the mod compares the repo before and after. Any file another process writes while that command runs (your editor, another Claude Code session, a sync tool such as Syncthing or Dropbox) looks like the command's work and is committed with it, with Claude's attribution.
 - Two sessions editing the same file: the commit takes the file as it is on disk.
-- A subagent's files are committed when Claude's turn ends (at once if Claude is already idle), one commit per agent.
-  In headless `claude -p` runs they are committed when the subagent finishes, as the process may exit before another
-  answer. If a commit is refused, the files are retried each time a turn ends.
+- A subagent's files are committed when Claude's turn ends, even one you interrupt with Esc (at once if Claude is
+  already idle), one commit per agent. In headless `claude -p` runs they are committed when the subagent finishes, as
+  the process may exit before another answer. If a commit is refused, the files are retried each time a turn ends.
 - The stale index warning reads the `git status` an auto-commit already runs, so it only shows in a repo where Claude
   changed something.
 - Files still pending when you quit stay uncommitted (they show in `git status`); a new session does not pick them up.
