@@ -159,6 +159,8 @@ test('stale index: staged entries that differ from the disk, staged deletions of
   expect(staleIndexCount('MM a\0D  b\0AD d\0?? b\0 M c\0A  e\0D  f\0')).toBe(3)
   expect(staleIndexCount('R  new\0old\0RM n2\0o2\0')).toBe(0)
   expect(staleIndexCount('')).toBe(0)
+  // Paths the auto-commit settles itself are left out.
+  expect(staleIndexCount('MM a\0D  b\0AD d\0?? b\0', new Set(['a', 'b']))).toBe(1)
 })
 
 test('prettyModel', () => {

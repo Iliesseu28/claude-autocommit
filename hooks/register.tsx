@@ -219,6 +219,9 @@ export const forget = (w: Work, root: string, paths: readonly string[], seen?: R
   for (const p of gone) w.edits.delete(editKey(root, p))
 }
 
+// Every path any agent left pending in `root`.
+const trackedIn = (w: Work, root: string): string[] => [...w.tracked.values()].flatMap(repos => [...(repos.get(root) ?? [])])
+
 // Mirrors `tracked` and `queue` into the host, and the pending count into the band.
 export async function saveTracking($: EngineInterface, c: Ctx): Promise<void> {
   const pending: PendingEntry[] = []
@@ -525,9 +528,12 @@ async function commitIn(
   const statusRaw = await statusText($, root)
   if (statusRaw === null) return none([])
   const status = parsePorcelain(statusRaw)
-  await warnStaleIndex($, c, root, staleIndexCount(statusRaw))
   const isCaseInsensitive = out(await git($, root, ['config', '--bool', '--get', 'core.ignorecase'])) === 'true'
   const { found, missing } = matchStatus(paths, status, isCaseInsensitive)
+  // Staged entries of files the mod commits itself (this commit's, or another
+  // agent's in this repo) say nothing of a stale index.
+  const mine = matchStatus([...paths, ...trackedIn(c.w, root)], status, isCaseInsensitive).found
+  await warnStaleIndex($, c, root, staleIndexCount(statusRaw, new Set(mine.keys())))
   const settled = [...missing]
   const spellings = (p: string): string[] => found.get(p) ?? [p]
 
@@ -1051,8 +1057,14 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // A main-loop request is only ever made inside a main turn: it also marks
+  // the turn under way after a reload in mid-turn. A tool call is no such sign
+  // (one can run between turns).
   on('turn.step', async function* (_$, e, next) {
-    if (e.agentId === undefined && e.effort !== undefined) liveEffort = String(e.effort)
+    if (e.agentId === undefined) {
+      w.isMainWorking = true
+      if (e.effort !== undefined) liveEffort = String(e.effort)
+    }
     return yield* next(e)
   })
 
@@ -1068,7 +1080,6 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     const agent = e.agentId ?? MAIN
     w.idle.delete(agent)
-    if (agent === MAIN) w.isMainWorking = true
     const tool = String(e.tool)
     if (tool === 'Edit' || tool === 'Write' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
       const result = await next(e)
@@ -1109,18 +1120,24 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     const agent = e.agentId ?? MAIN
     if (agent === MAIN) w.isMainWorking = false
-    if (e.reason !== 'answer') return result
-    w.idle.add(agent)
-    // A subagent done while the main loop still works (waiting for it, or
-    // going on): its files wait for the main turn's end, so a commit Claude
-    // makes of them meanwhile comes first and keeps its message. Headless
-    // (claude -p), they go at once: the process may end with no main answer.
-    if (agent !== MAIN && w.isMainWorking && w.isInteractive) return result
+    const isAnswer = e.reason === 'answer'
+    if (isAnswer) {
+      w.idle.add(agent)
+      // A subagent done while the main loop still works (waiting for it, or
+      // going on): its files wait for the main turn's end, so a commit Claude
+      // makes of them meanwhile comes first and keeps its message. Headless
+      // (claude -p), they go at once: the process may end with no main answer.
+      if (agent !== MAIN && w.isMainWorking && w.isInteractive) return result
+    } else if (agent !== MAIN) {
+      return result
+    }
     // This agent's files, and those every idle agent left pending (a
     // subagent that ended during the main turn, a commit refused or rolled
-    // back), whose turn will not end again.
+    // back), whose turn will not end again. A main turn cut short (Esc, an
+    // error) keeps its own files for its next answer, but the subagents that
+    // ended during it wait no more: the person may quit right after.
     for (const a of w.tracked.keys()) {
-      if (w.idle.has(a)) w.queue.add(a)
+      if (w.idle.has(a) && (isAnswer || a !== MAIN)) w.queue.add(a)
     }
     if (w.queue.size > 0) {
       await saveTracking($, c).catch(() => undefined)

@@ -561,6 +561,41 @@ test('a subagent that ends after the main turn is committed at once', async ($, 
   expect(w.commits.get(w.head)?.files).toEqual(['agent.ts'])
 })
 
+test("a main turn cut short (Esc) still lets a finished subagent's files go", async ($, on) => {
+  const { w, touch, clock, chain } = fakeWorld(on)
+  await $.session.start(start(true))
+  await $.turn.start({ text: 'go', turnId: 't' })
+  touch('main.ts')
+  await $.tool.call(write('main.ts'))
+  touch('agent.ts')
+  await $.tool.call(write('agent.ts', 'agent-1'))
+  await $.turn.complete(turnEnd('agent-1'))
+  await clock.advance(5000)
+  expect(w.head).toBe(BASE)
+
+  // The person presses Esc: the main turn ends with no answer, and may quit next.
+  await $.turn.complete({ ...turnEnd(), reason: 'aborted' as const, isAborted: true })
+  await clock.advance(100)
+  expect(chain()).toHaveLength(2)
+  expect(w.commits.get(w.head)?.files).toEqual(['agent.ts'])
+  // The main loop's own work waits for its next answer.
+  expect(await report($)).toContain('1 file pending')
+})
+
+test('a main tool call between turns never holds back a background subagent', async ($, on) => {
+  const { w, touch, clock } = fakeWorld(on)
+  await $.session.start(start(true))
+  await $.turn.start({ text: 'go', turnId: 't' })
+  await $.turn.complete(turnEnd())
+  // A command run outside any main turn is no sign the main loop works.
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  touch('agent.ts')
+  await $.tool.call(write('agent.ts', 'agent-1'))
+  await $.turn.complete(turnEnd('agent-1'))
+  await clock.advance(100)
+  expect(w.commits.get(w.head)?.files).toEqual(['agent.ts'])
+})
+
 test('headless: a subagent done while the main turn works is committed at once', async ($, on) => {
   const { w, touch } = fakeWorld(on)
   await $.session.start(start())
@@ -610,6 +645,19 @@ test('a stale index is reported once per repo, from 10 entries', async ($, on) =
   expect(w.toasts.filter(t => t.includes("git's index holds"))).toHaveLength(1)
   // The person's index is never touched for it.
   expect(w.userResets).toEqual([['a.ts'], ['b.ts'], ['c.ts']])
+})
+
+test('staged files the auto-commit settles itself are no stale index', async ($, on) => {
+  const { w, touch } = fakeWorld(on)
+  await $.session.start(start())
+  // Claude staged its work (`git add -A`), then edited the same ten files again.
+  for (let i = 0; i < 10; i += 1) {
+    touch(`f${i}.ts`, 'MM')
+    await $.tool.call(write(`f${i}.ts`))
+  }
+  await $.turn.complete(turnEnd())
+  expect(w.commits.get(w.head)?.files).toHaveLength(10)
+  expect(await report($)).not.toContain("git's index holds")
 })
 
 test('nothing of the mod stays in .git: message by stdin, index and journal deleted', async ($, on) => {

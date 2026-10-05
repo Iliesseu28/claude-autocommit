@@ -114,7 +114,9 @@ export const changedPaths = (
 // or a staged deletion (X is D) of a file still on disk (listed again as
 // untracked). A few are ordinary work in progress; many at once is the mark
 // of a `.git/index` that a folder sync copied back from another machine.
-export const staleIndexCount = (z: string): number => {
+// `mine` are the paths the auto-commit is about to settle itself (Claude ran
+// `git add`, then edited on): they are left out of the count.
+export const staleIndexCount = (z: string, mine: ReadonlySet<string> = new Set()): number => {
   const entries: Array<[string, string]> = []
   const parts = z.split('\0')
   for (let i = 0; i < parts.length; i += 1) {
@@ -126,7 +128,8 @@ export const staleIndexCount = (z: string): number => {
   }
   const untracked = new Set(entries.filter(([xy]) => xy === '??').map(([, p]) => p))
   return entries.filter(
-    ([xy, p]) => ((xy[0] === 'M' || xy[0] === 'A') && xy[1] !== ' ') || (xy[0] === 'D' && untracked.has(p)),
+    ([xy, p]) =>
+      !mine.has(p) && (((xy[0] === 'M' || xy[0] === 'A') && xy[1] !== ' ') || (xy[0] === 'D' && untracked.has(p))),
   ).length
 }
 
