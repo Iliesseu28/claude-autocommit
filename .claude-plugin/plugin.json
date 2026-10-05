@@ -1,6 +1,6 @@
 {
   "name": "autocommit",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Turns every turn Claude takes into a clean git commit: only the files that turn changed, a Conventional Commits message written by Haiku, a secret scan before every commit, undo and squash. Plus a band above the prompt with model, effort, context and commits.",
   "author": {
     "name": "Iliesseu28",

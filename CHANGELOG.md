@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.0 (2026-10-05)
+
+- Subagents: an agent that finishes while Claude is still working waits for the end of Claude's turn, then gets a
+  commit of its own (one per agent). Files Claude committed by hand meanwhile are left alone, with no alert. Headless
+  `claude -p` runs keep committing a subagent when it finishes.
+- Commit messages follow the style of the repo's last 8 hand-written subjects (type words, scope, capitalization),
+  in the configured language. Conventional Commits remains the default when there are none.
+- Stale index warning: when git's own index holds 10 or more staged entries that differ from the disk (often an old
+  index brought back by a folder sync), one alert per repo and session says how to see and clear them. The index is
+  never changed.
+- Nothing left in `.git`: the message goes to git on stdin, and the private index, the push list and the reset journal
+  are deleted instead of emptied.
+
 ## 1.0.0 (2026-10-03)
 
 First public release.

@@ -16,7 +16,7 @@ Claude's work with yours, or a string of `wip` commits. Asking Claude to commit 
 `git add -A` whatever is lying around.
 
 **autocommit** is a Claude Code mod that watches which files Claude itself changes. When the turn ends, it makes
-one commit per repo with a Conventional Commits message written from the actual diff, scans it for secrets first,
+one commit per repo with a message written from the actual diff in the style of your recent commits, scans it for secrets first,
 and leaves everything else in your working tree exactly as it was.
 
 https://github.com/user-attachments/assets/188f606e-935e-4aaa-b0c4-e5736469e642
@@ -41,11 +41,12 @@ on Windows 11 and in headless `claude -p` runs.
 |---|---|
 | **One commit per turn, per repo** | Claude's changes land as soon as its answer is done, about two seconds later. |
 | **Only Claude's files** | An edit is tracked by its path. A shell command is judged by comparing `git status` and file contents before and after it. Your own edits in the same repo stay out. |
-| **A message from the diff** | Haiku writes the subject (Conventional Commits) and one to three lines on *why*, in the language you pick. |
+| **A message from the diff** | Haiku writes the subject in the style of the repo's last hand-written subjects (type words, scope, capitalization; Conventional Commits when there are none) and one to three lines on *why*, in the language you pick. |
 | **A second pair of eyes** | The same call flags obvious slips in the diff (debug leftover, broken reference, half-finished code) as an alert. |
 | **A secret guard** | Every commit and every push is scanned: over 20 key formats, `.env`, `.pem`, `.p8`, `.p12`, SSH keys, service accounts. A flagged file is never committed. |
 | **Your index untouched** | Commits are built in a private git index. Whatever you had staged stays staged. |
-| **Subagents handled** | Each agent's files are committed when that agent's own turn ends. |
+| **Subagents handled** | A subagent that finishes while Claude is still working waits for the end of Claude's turn, then gets a commit of its own. Files Claude already committed by hand are left alone. |
+| **A stale index warning** | When git's own index holds 10 or more staged entries that differ from the disk (often an old index a folder sync copied back), one alert per repo says how to see and clear them. Your index is never changed. |
 | **Undo, squash, push** | `/commits undo`, `/commits squash`, `/commits push`. |
 | **A status bar** | Model, effort, context gauge, Remote Control, and the commit counters, above the prompt. |
 
@@ -57,10 +58,10 @@ on Windows 11 and in headless `claude -p` runs.
 flowchart LR
   E["Claude edits a file<br/>(Edit, Write, NotebookEdit)"] --> T["Tracked paths<br/>per agent and per repo"]
   B["Claude runs a shell command"] --> S["git status and content hashes<br/>before and after"] --> T
-  T -->|"the turn ends"| I["Private index:<br/>HEAD + the tracked paths"]
+  T -->|"Claude's turn ends<br/>(subagents wait for it)"| I["Private index:<br/>HEAD + the tracked paths"]
   I --> X{"Secret scan<br/>of the staged patch"}
   X -->|"flagged"| A["File dropped,<br/>alert shown"]
-  X --> M["Haiku writes the message<br/>and flags obvious bugs"]
+  X --> M["Haiku writes the message<br/>in the repo's style<br/>and flags obvious bugs"]
   M --> C["git commit"]
   C --> P{"Remote listed<br/>in autoPush?"}
   P -->|"yes"| Q["Scan outgoing commits,<br/>pre-push check, git push"]
@@ -113,14 +114,19 @@ To keep a repo out entirely, create an empty `.no-auto-commit` file at its root 
 - **Push unless you asked** or the remote is in `autoPush`. Never a force push.
 - **Rewrite pushed history.** `undo` and `squash` only touch unpushed commits made in this session.
 - **Lose your index on a crash.** A small journal in `.git/AUTOCOMMIT_RESET` lets the next run finish the index refresh.
+- **Leave files behind in `.git`.** The message goes to git on stdin; the private index, the push list and the journal are
+  deleted as soon as they have served.
 
 ## Honest limits
 
 - During a shell command, the mod compares the repo before and after. A file **you** save in your editor while that
   command runs looks like the command's work and will be committed with it.
 - Two sessions editing the same file: the commit takes the file as it is on disk.
-- A subagent's files are committed when that subagent finishes. If that commit is refused, they are retried each time
-  a turn ends.
+- A subagent's files are committed when Claude's turn ends (at once if Claude is already idle), one commit per agent.
+  In headless `claude -p` runs they are committed when the subagent finishes, as the process may exit before another
+  answer. If a commit is refused, the files are retried each time a turn ends.
+- The stale index warning reads the `git status` an auto-commit already runs, so it only shows in a repo where Claude
+  changed something.
 - Files still pending when you quit stay uncommitted (they show in `git status`); a new session does not pick them up.
 - Your git hooks do not run on auto-commits: Claude Code starts a mod's git commands with the repo's hooks turned off,
   a safety default. Checks that must pass belong in `prePushCommand` (run before every push) or in CI.
@@ -145,6 +151,13 @@ Yes. Commit whenever you like: autocommit only commits what is still pending at 
 **Will it commit my `.env`?**
 No. `.env*` (except `.env.example`), key files, keystores and service accounts are held back by name, before any scan.
 
+**My repos live in a synced folder (Syncthing, Dropbox, iCloud). Anything to know?**
+A sync that copies `.git` between machines can bring an old index back: `git status` then lists staged changes nobody
+made, and a plain `git commit` would commit them all. The mod warns once per repo when it sees 10 or more. See them
+with `git diff --cached --stat`; if they are not wanted, `git reset -q` clears them without touching the files on disk;
+or commit by naming files, `git commit -- <files>`. Auto-commits are built in an index of their own and leave nothing
+in `.git` for the sync to copy.
+
 **Does it work in a monorepo, a worktree, or several repos at once?**
 Yes. Each file is mapped to its own repo root by git; one turn that touches three repos makes three commits.
 
@@ -159,7 +172,7 @@ Yes. Each file is mapped to its own repo root by git; one turn that touches thre
 ```bash
 claude plugin validate . --strict      # marketplace manifest
 claude plugin validate .claude-plugin/plugin.json --strict
-claude plugin test .                   # 33 tests: pure helpers, then whole sessions against a fake git
+claude plugin test .                   # 48 tests: pure helpers, then whole sessions against a fake git
 python3 scripts/check.py               # JSON, manifests, no long dash, no machine path
 ```
 
